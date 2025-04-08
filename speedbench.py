@@ -31,29 +31,42 @@ else:
 # ~us~
 from fastkmeans import FastKMeans
 
-def generate_synthetic_data(n_samples, n_clusters, n_features=128, seed=42):
-    """Generate synthetic clustering data."""
+def generate_synthetic_data(n_samples, n_clusters, n_features=128, seed=42, random_clusters=False):
+    """
+    Generate synthetic clustering data.
+    
+    Args:
+        n_samples: Number of data points to generate
+        n_clusters: Number of clusters
+        n_features: Number of features per data point
+        seed: Random seed for reproducibility
+        random_clusters: If True, generate completely random data without cluster structure.
+                         If False, generate data centered around cluster centroids.
+    """
     print(f"Generating synthetic data: {n_samples} samples, {n_features} features, {n_clusters} clusters...")
     
     np.random.seed(seed)
     
-    # Generate cluster centers
-    centers = np.random.randn(n_clusters, n_features).astype(np.float32) * 10
+    if random_clusters:
+        # Generate completely random data without cluster structure
+        X = np.random.randn(n_samples, n_features).astype(np.float32) * 10
+        # Assign random cluster labels
+        cluster_indices = np.random.randint(0, n_clusters, size=n_samples)
+    else:
+        # Generate data centered around cluster centroids
+        centers = np.random.randn(n_clusters, n_features).astype(np.float32) * 10
+        X = np.empty((n_samples, n_features), dtype=np.float32)
+        batch_size = 100000  
+        cluster_indices = np.random.randint(0, n_clusters, size=n_samples)
+        for i in range(0, n_samples, batch_size):
+            end_idx = min(i + batch_size, n_samples)
+            batch_size_actual = end_idx - i
+            batch_centers = centers[cluster_indices[i:end_idx]]
+            noise = np.random.randn(batch_size_actual, n_features).astype(np.float32) * 5.0
+            X[i:end_idx] = batch_centers + noise
     
-    # Assign each point to a random cluster
-    cluster_indices = np.random.randint(0, n_clusters, size=n_samples)
-    
-    # Generate points around their cluster centers with some noise
-    X = np.zeros((n_samples, n_features), dtype=np.float32)
-    for i in range(n_samples):
-        X[i] = centers[cluster_indices[i]] + np.random.randn(n_features).astype(np.float32) * 2
-    
-    # Standardize features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X).astype(np.float32)
-    
-    print(f"Generated synthetic data: {X_scaled.shape[0]} samples, {X_scaled.shape[1]} features, {n_clusters} clusters")
-    return X_scaled, cluster_indices
+    print(f"Generated synthetic data: {X.shape[0]} samples, {X.shape[1]} features, {n_clusters} clusters")
+    return X.astype(np.float32), cluster_indices
 
 def run_fastkmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu'):
     """Run our PyTorch KMeans implementation."""
@@ -106,6 +119,7 @@ def run_faiss_kmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_0
     n_samples, n_features = data.shape
     
     # Create Faiss KMeans object
+    print(device)
     kmeans = faiss.Kmeans(
         d=n_features,
         k=k,
@@ -160,7 +174,7 @@ def evaluate_clustering(true_labels, predicted_labels, method_name):
     print(f"  Normalized Mutual Info (NMI): {nmi:.4f}")
     return nmi
 
-def plot_results(benchmarks, results, export_plots=True, device="cpu"):
+def plot_results(benchmarks, results, export_plots=True, device="cpu", random_clusters=False):
     """Plot benchmark results."""
     if not export_plots:
         return
@@ -178,19 +192,22 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu"):
     # Format device for title
     device_str = f"({device})" if device != "mps" else "(mps (if supported))"
     
+    # Format cluster type for title and filename
+    cluster_type = "random" if random_clusters else "structured"
+    
     # Plot execution times
     plt.figure(figsize=(14, 8))
     for method in results:
         if 'times' in results[method] and len(results[method]['times']) > 0:
             plt.plot(datasets, results[method]['times'], marker='o', linewidth=2, label=method)
     
-    plt.title(f'KMeans Execution Time Comparison {device_str}', fontsize=16)
+    plt.title(f'KMeans Execution Time Comparison {device_str} - {cluster_type} clusters', fontsize=16)
     plt.xlabel('Dataset (samples-clusters)', fontsize=14)
     plt.ylabel('Time (seconds)', fontsize=14)
     plt.xticks(rotation=45)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    plt.savefig("benchmark_plots/execution_times.png", dpi=300)
+    plt.savefig(f"benchmark_plots/execution_times_{device}_{cluster_type}.png", dpi=300)
     plt.close()
     
     # Plot NMI scores
@@ -199,17 +216,17 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu"):
         if 'nmi' in results[method] and len(results[method]['nmi']) > 0:
             plt.plot(datasets, results[method]['nmi'], marker='o', linewidth=2, label=method)
     
-    plt.title(f'KMeans Normalized Mutual Information Comparison {device_str}', fontsize=16)
+    plt.title(f'KMeans Normalized Mutual Information Comparison {device_str} - {cluster_type} clusters', fontsize=16)
     plt.xlabel('Dataset (samples-clusters)', fontsize=14)
     plt.ylabel('NMI Score', fontsize=14)
     plt.ylim(0.5, 1.1)  # Set y-axis limits from 0 to 1.2
     plt.xticks(rotation=45)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    plt.savefig("benchmark_plots/nmi_scores.png", dpi=300)
+    plt.savefig(f"benchmark_plots/nmi_scores_{device}_{cluster_type}.png", dpi=300)
     plt.close()
     
-    print("Plots saved to benchmark_plots/ directory")
+    print(f"Plots saved to benchmark_plots/ directory (device: {device}, cluster type: {cluster_type})")
 
 def main(
     max_points_per_centroid: int = 1_000_000_000,
@@ -223,7 +240,8 @@ def main(
     export_plots: bool = True,
     max_iters: int = 20,
     seed: int = 42,
-    n_features: int = 128
+    n_features: int = 128,
+    random_clusters: bool = False
 ):
     """
     Run KMeans benchmarks with various implementations.
@@ -273,7 +291,7 @@ def main(
         print(f"BENCHMARK: {n_samples} samples, {n_clusters} clusters")
         print(f"{'='*50}")
         
-        X, y = generate_synthetic_data(n_samples, n_clusters, n_features, seed)
+        X, y = generate_synthetic_data(n_samples, n_clusters, n_features, seed, random_clusters)
         
         if do_faiss:
             _, labels_faiss, time_faiss = run_faiss_kmeans(
@@ -317,7 +335,7 @@ def main(
             results['scikit-learn']['nmi'].append(nmi)
     
     # Plot results
-    plot_results(benchmarks, results, export_plots, device)
+    plot_results(benchmarks, results, export_plots, device, random_clusters)
     
     print("\nBenchmarking complete!")
 
