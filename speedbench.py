@@ -49,9 +49,9 @@ def generate_synthetic_data(n_samples, n_clusters, n_features=128, seed=42, rand
     
     if random_clusters:
         # Generate completely random data without cluster structure
-        X = np.random.randn(n_samples, n_features).astype(np.float32) * 10
+        X = np.random.randn(int(n_samples), n_features).astype(np.float32) * 10
         # Assign random cluster labels
-        cluster_indices = np.random.randint(0, n_clusters, size=n_samples)
+        cluster_indices = np.random.randint(0, n_clusters, size=int(n_samples))
     else:
         # Generate data centered around cluster centroids
         centers = np.random.randn(n_clusters, n_features).astype(np.float32) * 10
@@ -104,13 +104,19 @@ def run_fast_pytorch_kmeans(data, k, max_iters=20, seed=42, verbose=False):
     
     # Create Fast PyTorch KMeans object
     start_time = time.time()
-    kmeans = KMeans(n_clusters=k, mode='euclidean', verbose=1 if verbose else 0, max_iter=max_iters)
-    labels = kmeans.fit_predict(data)
+    # Convert numpy array to PyTorch tensor
+    data_tensor = torch.from_numpy(data)
+    data_tensor = data_tensor.cuda()
+    # Set minibatch size based on data size
+    minibatch = 15000
+    kmeans = KMeans(n_clusters=k, verbose=1 if verbose else 0, max_iter=max_iters, tol=-math.inf, minibatch=minibatch)
+    kmeans.fit(data_tensor)
+    labels = kmeans.predict(data_tensor)
     end_time = time.time()
     
     elapsed_time = end_time - start_time
     print(f"[Fast PyTorch KMeans] Done in {elapsed_time:.4f} seconds")
-    return kmeans.centroids, labels, elapsed_time
+    return kmeans.centroids, labels.cpu(), elapsed_time
 
 def run_faiss_kmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu'):
     """Run Faiss KMeans implementation."""
@@ -267,16 +273,17 @@ def main(
         torch.cuda.manual_seed_all(seed)
     
     # Define benchmark configurations
-    benchmarks = [
-        (10000, 64),      # 10k data points in 64 clusters
-        (100000, 256),    # 100k data points into 256 clusters
-        (500000, 16),     # 500k into 16 clusters
-        (500000, 512),    # 500k into 512 clusters
-        (1_000_000, 16),  # 1 million into 16 clusters
-        (1_000_000, 1024),  # 1 million into 1024 clusters
-        (5_000_000, 2048), # 5 million into 2048 clusters
-        (5_000_000, 8192) # 5 million into 8192 clusters
-    ]
+    def colbert_partition_counter(n_docs): return int(2 ** np.floor(np.log2(16 * np.sqrt(n_docs*300))))
+    def colbert_sampler(n_docs): return (16 * np.sqrt(120 * n_docs))
+
+    n_docs = [1000, 10000, 100_000, 500_000, 5_000_000, 10_000_000]
+    
+    benchmarks = []
+    for n in n_docs:
+        sampled_passages = colbert_partition_counter(colbert_sampler(n))
+        benchmarks.append((colbert_partition_counter(colbert_sampler(n))*100, colbert_partition_counter(colbert_sampler(n))))
+    # Sort benchmarks by number of samples for easier interpretation
+    benchmarks.sort(key=lambda x: (x[0], x[1]))
     
     # Store results for plotting
     results = {
@@ -305,6 +312,7 @@ def main(
             results['Faiss']['nmi'].append(nmi)
         
         if do_fastkmeans:
+            # Not necessary to run -- OOMs on larger cluster sizes and the minibatching implementation creates very bad clusters.
             _, labels_torch, time_torch = run_fastkmeans(
                 X, n_clusters, max_iters, seed, 
                 max_points_per_centroid=max_points_per_centroid, 
