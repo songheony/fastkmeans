@@ -1,0 +1,17 @@
+[project]
+name = "fastkmeans"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["torch", "numpy"]
+authors = [
+  {name = "Ben Clavié", email = "bc@answer.ai" }
+]
+maintainers = [
+  {name = "Ben Clavié", email = "bc@answer.ai" }
+]
+license = {text = "Apache-2.0"}
+
+[tool.setuptools]
+packages = ["fastkmeans"]
