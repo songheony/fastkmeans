@@ -1,8 +1,8 @@
 # fastkmeans
 
 ![Python Versions](https://img.shields.io/badge/Python-3.8_3.9_3.10_3.11_3.12_3.13-blue)
-<!-- [![Downloads](https://static.pepy.tech/badge/fastkmeans/month)](https://pepy.tech/project/fastkmeans) -->
 [![Twitter Follow](https://img.shields.io/twitter/follow/bclavie?style=social)](https://twitter.com/bclavie)
+<!-- [![Downloads](https://static.pepy.tech/badge/fastkmeans/month)](https://pepy.tech/project/fastkmeans) -->
 
 _A fast and efficient k-means implementation for PyTorch, with support for GPU and CPU._
 
