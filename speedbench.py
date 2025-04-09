@@ -68,7 +68,7 @@ def generate_synthetic_data(n_samples, n_clusters, n_features=128, seed=42, rand
     print(f"Generated synthetic data: {X.shape[0]} samples, {X.shape[1]} features, {n_clusters} clusters")
     return X.astype(np.float32), cluster_indices
 
-def run_fastkmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu'):
+def run_fastkmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu', do_evals=False):
     """Run our PyTorch KMeans implementation."""
     print(f"\n=== PyTorch KMeans on {data.shape[0]} samples, {k} clusters ===")
     n_features = data.shape[1]
@@ -90,13 +90,15 @@ def run_fastkmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000
     start_time = time.time()
     kmeans.train(data)
     end_time = time.time()
-    labels = kmeans.predict(data)
+    if do_evals:
+        labels = kmeans.predict(data)
+    else: labels = None
     
     elapsed_time = end_time - start_time
     print(f"[PyTorch KMeans] Done in {elapsed_time:.4f} seconds")
     return kmeans.centroids, labels, elapsed_time
 
-def run_fast_pytorch_kmeans(data, k, max_iters=20, seed=42, verbose=False):
+def run_fast_pytorch_kmeans(data, k, max_iters=20, seed=42, verbose=False, do_evals=False):
     """Run Fast PyTorch KMeans implementation."""
     print(f"\n=== Fast PyTorch KMeans on {data.shape[0]} samples, {k} clusters ===")       
     
@@ -111,14 +113,15 @@ def run_fast_pytorch_kmeans(data, k, max_iters=20, seed=42, verbose=False):
     minibatch = 15000
     kmeans = KMeans(n_clusters=k, verbose=1 if verbose else 0, max_iter=max_iters, tol=-math.inf, minibatch=minibatch)
     kmeans.fit(data_tensor)
-    labels = kmeans.predict(data_tensor)
+    if do_evals: labels = kmeans.predict(data_tensor)
+    else: labels = None
     end_time = time.time()
     
     elapsed_time = end_time - start_time
     print(f"[Fast PyTorch KMeans] Done in {elapsed_time:.4f} seconds")
     return kmeans.centroids, labels.cpu(), elapsed_time
 
-def run_faiss_kmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu'):
+def run_faiss_kmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_000_000_000, verbose=False, device='cpu', do_evals=False):
     """Run Faiss KMeans implementation."""
     print(f"\n=== Faiss KMeans on {data.shape[0]} samples, {k} clusters ===")       
     
@@ -140,8 +143,10 @@ def run_faiss_kmeans(data, k, max_iters=20, seed=42, max_points_per_centroid=1_0
     start_time = time.time()
     kmeans.train(data)
     end_time = time.time()
-    _, labels = kmeans.index.search(data, 1)
-    labels = labels.reshape(-1)
+    if do_evals:
+        _, labels = kmeans.index.search(data, 1)
+        labels = labels.reshape(-1)
+    else: labels = None
     
     elapsed_time = end_time - start_time
     print(f"[Faiss KMeans] Done in {elapsed_time:.4f} seconds")
@@ -180,7 +185,7 @@ def evaluate_clustering(true_labels, predicted_labels, method_name):
     print(f"  Normalized Mutual Info (NMI): {nmi:.4f}")
     return nmi
 
-def plot_results(benchmarks, results, export_plots=True, device="cpu", random_clusters=False):
+def plot_results(benchmarks, results, export_plots=True, device="cpu", random_clusters=False, do_evals=False):
     """Plot benchmark results."""
     if not export_plots:
         return
@@ -216,22 +221,23 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
     plt.savefig(f"benchmark_plots/execution_times_{device}_{cluster_type}.png", dpi=300)
     plt.close()
     
-    # Plot NMI scores
-    plt.figure(figsize=(14, 8))
-    for method in results:
-        if 'nmi' in results[method] and len(results[method]['nmi']) > 0:
-            plt.plot(datasets, results[method]['nmi'], marker='o', linewidth=2, label=method)
-    
-    plt.title(f'KMeans Normalized Mutual Information Comparison {device_str} - {cluster_type} clusters', fontsize=16)
-    plt.xlabel('Dataset (samples-clusters)', fontsize=14)
-    plt.ylabel('NMI Score', fontsize=14)
-    plt.ylim(0.5, 1.1)  # Set y-axis limits from 0 to 1.2
-    plt.xticks(rotation=45)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    plt.savefig(f"benchmark_plots/nmi_scores_{device}_{cluster_type}.png", dpi=300)
-    plt.close()
-    
+    if do_evals:
+        # Plot NMI scores
+        plt.figure(figsize=(14, 8))
+        for method in results:
+            if 'nmi' in results[method] and len(results[method]['nmi']) > 0:
+                plt.plot(datasets, results[method]['nmi'], marker='o', linewidth=2, label=method)
+            
+        plt.title(f'KMeans Normalized Mutual Information Comparison {device_str} - {cluster_type} clusters', fontsize=16)
+        plt.xlabel('Dataset (samples-clusters)', fontsize=14)
+        plt.ylabel('NMI Score', fontsize=14)
+        plt.ylim(0.5, 1.1)  # Set y-axis limits from 0 to 1.2
+        plt.xticks(rotation=45)
+        plt.legend(fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"benchmark_plots/nmi_scores_{device}_{cluster_type}.png", dpi=300)
+        plt.close()
+        
     print(f"Plots saved to benchmark_plots/ directory (device: {device}, cluster type: {cluster_type})")
 
 def main(
@@ -244,10 +250,12 @@ def main(
     do_fastkmeans: bool = True,
     device: str = "cpu",
     export_plots: bool = True,
-    max_iters: int = 20,
+    max_iters: int = 10,
     seed: int = 42,
     n_features: int = 128,
-    random_clusters: bool = False
+    do_evals: bool = False,
+    random_clusters: bool = False,
+    do_only_small: bool = False,
 ):
     """
     Run KMeans benchmarks with various implementations.
@@ -276,8 +284,12 @@ def main(
     def colbert_partition_counter(n_docs): return int(2 ** np.floor(np.log2(16 * np.sqrt(n_docs*300))))
     def colbert_sampler(n_docs): return (16 * np.sqrt(120 * n_docs))
 
-    n_docs = [1000, 10000, 100_000, 500_000, 5_000_000, 10_000_000]
-    
+    # This will cover the most common ColBERT uses: 8192, 16384, 32768, 65536, 131072 and 262144 clusters. Anything larger should reasonably be done multi-GPU using faiss.
+    n_docs = [100, 1000, 100_000, 500_000, 5_000_000, 50_000_000]
+
+    if do_only_small: 
+        n_docs = n_docs[:-2]
+
     benchmarks = []
     for n in n_docs:
         sampled_passages = colbert_partition_counter(colbert_sampler(n))
@@ -287,11 +299,15 @@ def main(
     
     # Store results for plotting
     results = {
-        'Faiss': {'times': [], 'nmi': []},
-        'FastKMeans': {'times': [], 'nmi': []},
-        'Fast PyTorch KMeans': {'times': [], 'nmi': []},
-        'scikit-learn': {'times': [], 'nmi': []}
+        'Faiss': {'times': []},
+        'FastKMeans': {'times': []},
+        'Fast PyTorch KMeans': {'times': []},
+        'scikit-learn': {'times': []}
     }
+    
+    if do_evals:
+        for key in results:
+            results[key]['nmi'] = []
     
     for n_samples, n_clusters in benchmarks:
         print(f"\n{'='*50}")
@@ -305,11 +321,13 @@ def main(
                 X, n_clusters, max_iters, seed, 
                 max_points_per_centroid=max_points_per_centroid, 
                 verbose=verbose,
-                device=device
+                device=device,
+                do_evals=do_evals
             )
-            nmi = evaluate_clustering(y, labels_faiss, "Faiss KMeans")
-            results['Faiss']['times'].append(time_faiss)
-            results['Faiss']['nmi'].append(nmi)
+            if do_evals:
+                nmi = evaluate_clustering(y, labels_faiss, "Faiss KMeans")
+                results['Faiss']['times'].append(time_faiss)
+                results['Faiss']['nmi'].append(nmi)
         
         if do_fastkmeans:
             # Not necessary to run -- OOMs on larger cluster sizes and the minibatching implementation creates very bad clusters.
@@ -317,33 +335,37 @@ def main(
                 X, n_clusters, max_iters, seed, 
                 max_points_per_centroid=max_points_per_centroid, 
                 verbose=verbose,
-                device=device
+                device=device,
+                do_evals=do_evals
             )
-            nmi = evaluate_clustering(y, labels_torch, "PyTorch KMeans")
-            results['FastKMeans']['times'].append(time_torch)
-            results['FastKMeans']['nmi'].append(nmi)
+            if do_evals:
+                nmi = evaluate_clustering(y, labels_torch, "PyTorch KMeans")
+                results['FastKMeans']['times'].append(time_torch)
+                results['FastKMeans']['nmi'].append(nmi)
         else: del results['FastKMeans']
 
         if do_pytorch_fast_kmeans and fast_pytorch_kmeans_available and torch.cuda.is_available():
             _, labels_fast_pytorch_kmeans, time_fast_pytorch = run_fast_pytorch_kmeans(
-                X, n_clusters, max_iters, seed, verbose=verbose
+                X, n_clusters, max_iters, seed, verbose=verbose, do_evals=do_evals
             )
-            nmi = evaluate_clustering(y, labels_fast_pytorch_kmeans, "Fast PyTorch KMeans")
-            results['Fast PyTorch KMeans']['times'].append(time_fast_pytorch)
-            results['Fast PyTorch KMeans']['nmi'].append(nmi)
+            if do_evals:
+                nmi = evaluate_clustering(y, labels_fast_pytorch_kmeans, "Fast PyTorch KMeans")
+                results['Fast PyTorch KMeans']['times'].append(time_fast_pytorch)
+                results['Fast PyTorch KMeans']['nmi'].append(nmi)
 
         max_sklearn_samples = 500_000 if not do_big_sklearn else 100_000_000
         
-        if do_sklearn and n_samples <= max_sklearn_samples:  # Skip for the larger runs because it is _exceedingly_ slow
+        if do_sklearn:  # Skip for the larger runs because it is _exceedingly_ slow
             _, labels_sklearn, time_sklearn = run_sklearn_kmeans(
                 X, n_clusters, max_iters, seed, verbose=verbose
             )
-            nmi = evaluate_clustering(y, labels_sklearn, "scikit-learn KMeans")
-            results['scikit-learn']['times'].append(time_sklearn)
-            results['scikit-learn']['nmi'].append(nmi)
+            if do_evals:
+                nmi = evaluate_clustering(y, labels_sklearn, "scikit-learn KMeans")
+                results['scikit-learn']['times'].append(time_sklearn)
+                results['scikit-learn']['nmi'].append(nmi)
     
     # Plot results
-    plot_results(benchmarks, results, export_plots, device, random_clusters)
+    plot_results(benchmarks, results, export_plots, device, random_clusters, do_evals)
     
     print("\nBenchmarking complete!")
 
