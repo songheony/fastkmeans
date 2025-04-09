@@ -184,7 +184,7 @@ class FastKMeans:
         self.chunk_size_data = chunk_size_data
         self.chunk_size_centroids = chunk_size_centroids
         self.centroids = None
-        if device is not None and self.gpu: print("Warning: device is set to 'cuda' but gpu is True, ignoring 'device' argument and setting it to 'cuda'!")
+        if device not in [None, 'cuda'] and self.gpu: print("Warning: device is set to 'cuda' but gpu is True, ignoring 'device' argument and setting it to 'cuda'!")
         self.device = 'cuda' if self.gpu else device
         self.dtype = dtype
         self.pin_gpu_memory = pin_gpu_memory
