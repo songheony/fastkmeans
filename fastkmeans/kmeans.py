@@ -196,7 +196,7 @@ class FastKMeans:
         max_points_per_centroid: int = 256,
         chunk_size_data: int = 50_000,
         chunk_size_centroids: int = 10_000,
-        device: str = None,
+        device: str | int | torch.device | None = None,
         dtype: torch.dtype = None,
         pin_gpu_memory: bool = True,
         verbose: bool = False,
@@ -207,24 +207,20 @@ class FastKMeans:
         self.k = k
         self.niter = niter
         self.tol = tol
-        self.gpu = gpu
         self.seed = seed
         self.max_points_per_centroid = max_points_per_centroid
         self.chunk_size_data = chunk_size_data
         self.chunk_size_centroids = chunk_size_centroids
+        self.device = _get_device("cpu" if gpu is False else device)
         self.centroids = None
-        if device not in [None, 'cuda'] and self.gpu:
-            print("Warning: device is set to 'cuda' but gpu is True, ignoring 'device' argument and setting it to 'cuda'!")
-        self.device = 'cuda' if self.gpu else device
         self.dtype = dtype
         self.pin_gpu_memory = pin_gpu_memory
-        if nredo != 1:
-            raise ValueError("nredo must be 1, redos not currently supported")
         self.verbose = verbose
-        self.device = _get_device(self.device)
         if use_triton is not False:
             use_triton = _is_bfloat16_supported(self.device) # assume triton is supported if GPU supports bfloat16
         self.use_triton = use_triton
+        if nredo != 1:
+            raise ValueError("nredo must be 1, redos not currently supported")
 
     def train(self, data: np.ndarray):
         """
@@ -286,11 +282,7 @@ class FastKMeans:
 
         # We'll do a chunked assignment pass, similar to the main loop, but no centroid updates
         centroids_torch = torch.from_numpy(self.centroids)
-        device = centroids_torch.device.type
-        if device == 'cpu' and self.gpu and torch.cuda.is_available():
-            device = 'cuda'  # If user asked for GPU, put centroids there
-
-        centroids_torch = centroids_torch.to(device=device, dtype=torch.float32)
+        centroids_torch = centroids_torch.to(device=self.device, dtype=torch.float32)
         centroid_norms = (centroids_torch ** 2).sum(dim=1)
 
         n_samples = data_torch.shape[0]
@@ -300,10 +292,10 @@ class FastKMeans:
         while start_idx < n_samples:
             end_idx = min(start_idx + self.chunk_size_data, n_samples)
 
-            data_chunk = data_torch[start_idx:end_idx].to(device=device, dtype=torch.float32, non_blocking=True)
-            data_chunk_norms = data_norms_torch[start_idx:end_idx].to(device=device, dtype=torch.float32, non_blocking=True)
+            data_chunk = data_torch[start_idx:end_idx].to(device=self.device, dtype=torch.float32, non_blocking=True)
+            data_chunk_norms = data_norms_torch[start_idx:end_idx].to(device=self.device, dtype=torch.float32, non_blocking=True)
             batch_size = data_chunk.size(0)
-            best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+            best_ids = torch.zeros((batch_size,), device=self.device, dtype=torch.long)
 
             if self.use_triton:
                 chunked_kmeans_kernel(
@@ -314,7 +306,7 @@ class FastKMeans:
                     best_ids,
                 )
             else:
-                best_dist = torch.full((batch_size,), float('inf'), device=device, dtype=torch.float32)
+                best_dist = torch.full((batch_size,), float('inf'), device=self.device, dtype=torch.float32)
                 c_start = 0
                 k = centroids_torch.shape[0]
                 while c_start < k:
