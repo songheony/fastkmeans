@@ -116,8 +116,7 @@ def run_fast_pytorch_kmeans(data, k, max_iters=20, seed=42, verbose=False, do_ev
     data_tensor = torch.from_numpy(data)
     data_tensor = data_tensor.cuda()
     # Set minibatch size based on data size
-    minibatch = 15000
-    kmeans = KMeans(n_clusters=k, verbose=1 if verbose else 0, max_iter=max_iters, tol=-math.inf, minibatch=minibatch)
+    kmeans = KMeans(n_clusters=k, verbose=1 if verbose else 0, max_iter=max_iters, tol=-math.inf)
     kmeans.fit(data_tensor)
     if do_evals:
         labels = kmeans.predict(data_tensor)
@@ -194,7 +193,6 @@ def evaluate_clustering(true_labels, predicted_labels, method_name):
     print(f"[{method_name}] Evaluation Metrics:")
     print(f"  Normalized Mutual Info (NMI): {nmi:.4f}")
     return nmi
-
 def plot_results(benchmarks, results, export_plots=True, device="cpu", random_clusters=False, do_evals=False):
     """Plot benchmark results."""
     if not export_plots:
@@ -220,7 +218,30 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
     plt.figure(figsize=(14, 8))
     for method in results:
         if 'times' in results[method] and len(results[method]['times']) > 0:
-            plt.plot(datasets, results[method]['times'], marker='o', linewidth=2, label=method)
+            # Filter out 'OOM' entries for plotting
+            valid_times = []
+            valid_datasets = []
+            oom_index = None
+            
+            for i, time_value in enumerate(results[method]['times']):
+                if time_value == 'OOM':
+                    oom_index = i - 1 if i > 0 else None
+                    break
+                valid_times.append(time_value)
+                valid_datasets.append(datasets[i])
+            
+            # Plot valid times
+            plt.plot(valid_datasets, valid_times, marker='o', linewidth=2, label=method)
+            
+            # Add red cross for OOM if applicable
+            if oom_index is not None and oom_index >= 0:
+                plt.plot(valid_datasets[-1], valid_times[-1], 'rx', markersize=12, markeredgewidth=3)
+                plt.annotate('OOM afterwards', 
+                             xy=(valid_datasets[-1], valid_times[-1]),
+                             xytext=(10, 10), 
+                             textcoords='offset points',
+                             color='red',
+                             fontweight='bold')
 
     plt.title(f'KMeans Execution Time Comparison {device_str} - {cluster_type} clusters', fontsize=16)
     plt.xlabel('Dataset (samples-clusters)', fontsize=14)
@@ -236,7 +257,30 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
         plt.figure(figsize=(14, 8))
         for method in results:
             if 'nmi' in results[method] and len(results[method]['nmi']) > 0:
-                plt.plot(datasets, results[method]['nmi'], marker='o', linewidth=2, label=method)
+                # Filter out 'OOM' entries for plotting
+                valid_nmi = []
+                valid_datasets = []
+                oom_index = None
+                
+                for i, nmi_value in enumerate(results[method]['nmi']):
+                    if nmi_value == 'OOM':
+                        oom_index = i - 1 if i > 0 else None
+                        break
+                    valid_nmi.append(nmi_value)
+                    valid_datasets.append(datasets[i])
+                
+                # Plot valid NMI scores
+                plt.plot(valid_datasets, valid_nmi, marker='o', linewidth=2, label=method)
+                
+                # Add red cross for OOM if applicable
+                if oom_index is not None and oom_index >= 0:
+                    plt.plot(valid_datasets[-1], valid_nmi[-1], 'rx', markersize=12, markeredgewidth=3)
+                    plt.annotate('OOM afterwards', 
+                                 xy=(valid_datasets[-1], valid_nmi[-1]),
+                                 xytext=(10, 10), 
+                                 textcoords='offset points',
+                                 color='red',
+                                 fontweight='bold')
 
         plt.title(f'KMeans Normalized Mutual Information Comparison {device_str} - {cluster_type} clusters', fontsize=16)
         plt.xlabel('Dataset (samples-clusters)', fontsize=14)
@@ -281,8 +325,8 @@ def main(
     def colbert_partition_counter(n_docs): return int(2 ** np.floor(np.log2(16 * np.sqrt(n_docs*300))))
     def colbert_sampler(n_docs): return (16 * np.sqrt(120 * n_docs))
 
-    # This will cover the most common ColBERT uses: 8192, 16384, 32768, 65536, 131072 and 262144 clusters. Anything larger should reasonably be done multi-GPU using faiss.
-    n_docs = [100, 1000, 100_000, 500_000, 5_000_000, 50_000_000]
+    # This will cover the most common ColBERT uses: 8192, 16384, 32768, 65536 and 131072 clusters. Anything larger should reasonably be done multi-GPU using faiss.
+    n_docs = [100, 1000, 100_000, 500_000, 5_000_000]
 
     if do_only_small:
         n_docs = n_docs[:-2]
@@ -368,9 +412,15 @@ def main(
             del results['FastKMeans_triton']
 
         if do_pytorch_fast_kmeans and fast_pytorch_kmeans_available and torch.cuda.is_available():
-            _, labels_fast_pytorch_kmeans, time_fast_pytorch = run_fast_pytorch_kmeans(
-                X, n_clusters, max_iters, seed, verbose=verbose, do_evals=do_evals
-            )
+            try:
+                _, labels_fast_pytorch_kmeans, time_fast_pytorch = run_fast_pytorch_kmeans(
+                    X, n_clusters, max_iters, seed, verbose=verbose, do_evals=do_evals
+                )
+            except torch.cuda.OutOfMemoryError:
+                print("[Fast PyTorch KMeans] Out of memory error")
+                time_fast_pytorch = "OOM"
+                labels_fast_pytorch_kmeans = None
+                if do_evals: results['Fast PyTorch KMeans']['nmi'].append(0.)
             if do_evals:
                 nmi = evaluate_clustering(y, labels_fast_pytorch_kmeans, "Fast PyTorch KMeans")
                 results['Fast PyTorch KMeans']['times'].append(time_fast_pytorch)
