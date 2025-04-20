@@ -3,8 +3,6 @@ import time
 import torch
 import numpy as np
 
-from fastkmeans.triton_kernels import chunked_kmeans_kernel
-
 def _get_device(preset: str | int | torch.device | None = None):
     if isinstance(preset, torch.device):
         return preset
@@ -52,6 +50,9 @@ def _kmeans_torch_double_chunked(
     labels_cpu    : torch.Tensor, shape (n_samples_used,), long
         Where n_samples_used can be smaller than the original if subsampling occurred.
     """
+
+    if use_triton:
+        from fastkmeans.triton_kernels import chunked_kmeans_kernel
 
     if dtype is None:
         dtype = torch.float16 if device.type in ['cuda', 'xpu'] else torch.float32
@@ -274,6 +275,8 @@ class FastKMeans:
         -------
         labels : np.ndarray of shape (n_samples,), int64
         """
+        if self.use_triton:
+            from fastkmeans.triton_kernels import chunked_kmeans_kernel
         if self.centroids is None:
             raise RuntimeError("Must call train() or fit() before predict().")
 
