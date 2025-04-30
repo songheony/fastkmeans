@@ -1,26 +1,35 @@
 import time
 
-import torch
 import numpy as np
+import torch
+
+try:
+    from fastkmeans.triton_kernels import triton_kmeans
+
+    HAS_TRITON = True
+except ImportError:
+    triton_kmeans = None
+    HAS_TRITON = False
+
 
 def _get_device(preset: str | int | torch.device | None = None):
     if isinstance(preset, torch.device):
         return preset
     if isinstance(preset, str):
         return torch.device(preset)
-    if torch.cuda.is_available(): # cuda currently handles both AMD and NVIDIA GPUs
+    if torch.cuda.is_available():  # cuda currently handles both AMD and NVIDIA GPUs
         return torch.device(f"cuda:{preset if isinstance(preset, int) and preset < torch.cuda.device_count() else 0}")
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return torch.device('mps')
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        return torch.device(f'xpu:{preset if isinstance(preset, int) and preset < torch.xpu.device_count() else 0}')
-    return torch.device('cpu')
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device(f"xpu:{preset if isinstance(preset, int) and preset < torch.xpu.device_count() else 0}")
+    return torch.device("cpu")
 
 
-def _is_bfloat16_supported(device:torch.device):
-    if device.type == 'cuda':
+def _is_bfloat16_supported(device: torch.device):
+    if device.type == "cuda":
         return torch.cuda.is_bf16_supported()
-    elif device.type == 'xpu' and hasattr(torch.xpu, 'is_bf16_supported'):
+    elif device.type == "xpu" and hasattr(torch.xpu, "is_bf16_supported"):
         return torch.xpu.is_bf16_supported()
     else:
         return False
@@ -52,10 +61,11 @@ def _kmeans_torch_double_chunked(
     """
 
     if use_triton:
-        from fastkmeans.triton_kernels import chunked_kmeans_kernel
+        if not HAS_TRITON:
+            raise ImportError("Triton is not available. Please install Triton and try again.")
 
     if dtype is None:
-        dtype = torch.float16 if device.type in ['cuda', 'xpu'] else torch.float32
+        dtype = torch.float16 if device.type in ["cuda", "xpu"] else torch.float32
 
     n_samples_original, n_features = data.shape
     n_samples = n_samples_original
@@ -77,12 +87,12 @@ def _kmeans_torch_double_chunked(
     centroids = data[rand_indices].clone().to(device=device, dtype=dtype)
     prev_centroids = centroids.clone()
 
-    labels = torch.empty(n_samples, dtype=torch.int64, device='cpu')  # Keep labels on CPU
+    labels = torch.empty(n_samples, dtype=torch.int64, device="cpu")  # Keep labels on CPU
 
     for iteration in range(max_iters):
         iteration_start_time = time.time()
 
-        centroid_norms = (centroids ** 2).sum(dim=1)
+        centroid_norms = (centroids**2).sum(dim=1)
         cluster_sums = torch.zeros((k, n_features), device=device, dtype=torch.float32)
         cluster_counts = torch.zeros((k,), device=device, dtype=torch.float32)
 
@@ -96,7 +106,7 @@ def _kmeans_torch_double_chunked(
             best_ids = torch.zeros((batch_size,), device=device, dtype=torch.int64)
 
             if use_triton:
-                chunked_kmeans_kernel(
+                triton_kmeans(
                     data_chunk=data_chunk,
                     data_chunk_norms=data_chunk_norms,
                     centroids=centroids,
@@ -104,7 +114,7 @@ def _kmeans_torch_double_chunked(
                     best_ids=best_ids,
                 )
             else:
-                best_dist = torch.full((batch_size,), float('inf'), device=device, dtype=dtype)
+                best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=dtype)
                 c_start = 0
                 while c_start < k:
                     c_end = min(c_start + chunk_size_centroids, k)
@@ -117,23 +127,23 @@ def _kmeans_torch_double_chunked(
                     local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
                     improved_mask = local_min_vals < best_dist
                     best_dist[improved_mask] = local_min_vals[improved_mask]
-                    best_ids[improved_mask] = (c_start + local_min_ids[improved_mask])
+                    best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
 
                     c_start = c_end
 
             cluster_sums.index_add_(0, best_ids, data_chunk.float())
             cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, device=device, dtype=torch.float32))
 
-            labels[start_idx:end_idx] = best_ids.to('cpu', non_blocking=True)
+            labels[start_idx:end_idx] = best_ids.to("cpu", non_blocking=True)
             start_idx = end_idx
 
         new_centroids = torch.zeros_like(centroids, device=device, dtype=dtype)
-        non_empty = (cluster_counts > 0)
+        non_empty = cluster_counts > 0
         new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=dtype)
 
         empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
         if len(empty_ids) > 0:
-            reinit_indices = torch.randint(0, n_samples, (len(empty_ids),), device='cpu')
+            reinit_indices = torch.randint(0, n_samples, (len(empty_ids),), device="cpu")
             random_data = data[reinit_indices].to(device=device, dtype=dtype, non_blocking=True)
             new_centroids[empty_ids] = random_data
 
@@ -144,14 +154,16 @@ def _kmeans_torch_double_chunked(
 
         iteration_time = time.time() - iteration_start_time
         if verbose:
-            print(f"Iteration {iteration+1}/{max_iters} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}")
+            print(
+                f"Iteration {iteration + 1}/{max_iters} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}"
+            )
 
         if shift < tol:
             if verbose:
-                print(f"Converged after {iteration+1} iterations (shift: {shift:.6f} < tol: {tol})")
+                print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {tol})")
             break
 
-    centroids_cpu = centroids.to('cpu', dtype=torch.float32)
+    centroids_cpu = centroids.to("cpu", dtype=torch.float32)
     return centroids_cpu, labels
 
 
@@ -177,9 +189,9 @@ class FastKMeans:
     max_points_per_centroid : int, optional, default=1_000_000_000
         If n_samples > k * max_points_per_centroid, the data will be subsampled to exactly
         k * max_points_per_centroid points before clustering.
-    chunk_size_data : int, default=50_000
+    chunk_size_data : int, default=10,2400
         Chunk size along the data dimension for assignment/update steps.
-    chunk_size_centroids : int, default=10_000
+    chunk_size_centroids : int, default=10,240
         Chunk size along the centroid dimension for assignment/update steps.
     use_triton : bool | None, default=None
        Use the fast Triton backend for the assignment/update steps.
@@ -195,13 +207,13 @@ class FastKMeans:
         gpu: bool = True,
         seed: int = 0,
         max_points_per_centroid: int = 256,
-        chunk_size_data: int = 50_000,
-        chunk_size_centroids: int = 10_000,
+        chunk_size_data: int = 102_400,
+        chunk_size_centroids: int = 10_240,
         device: str | int | torch.device | None = None,
         dtype: torch.dtype = None,
         pin_gpu_memory: bool = True,
         verbose: bool = False,
-        nredo: int = 1, # for compatibility only
+        nredo: int = 1,  # for compatibility only
         use_triton: bool | None = None,
     ):
         self.d = d
@@ -218,7 +230,10 @@ class FastKMeans:
         self.pin_gpu_memory = pin_gpu_memory
         self.verbose = verbose
         if use_triton is not False:
-            use_triton = _is_bfloat16_supported(self.device) # assume triton is supported if GPU supports bfloat16
+            # assume triton kernel is supported if GPU supports bfloat16
+            use_triton = HAS_TRITON and _is_bfloat16_supported(self.device)
+        if use_triton and not HAS_TRITON:
+            raise ValueError("Triton is not available. Please install Triton and try again.")
         self.use_triton = use_triton
         if nredo != 1:
             raise ValueError("nredo must be 1, redos not currently supported")
@@ -237,10 +252,10 @@ class FastKMeans:
 
         # Move data to PyTorch CPU Tensor
         data_torch = torch.from_numpy(data)
-        data_norms_torch = (data_torch ** 2).sum(dim=1)
+        data_norms_torch = (data_torch**2).sum(dim=1)
 
         device = _get_device(self.device)
-        if device == 'cuda' and self.pin_gpu_memory:
+        if device == "cuda" and self.pin_gpu_memory:
             data_torch = data_torch.pin_memory()
             data_norms_torch = data_norms_torch.pin_memory()
 
@@ -275,33 +290,33 @@ class FastKMeans:
         -------
         labels : np.ndarray of shape (n_samples,), int64
         """
-        if self.use_triton:
-            from fastkmeans.triton_kernels import chunked_kmeans_kernel
         if self.centroids is None:
             raise RuntimeError("Must call train() or fit() before predict().")
 
         data_torch = torch.from_numpy(data)
-        data_norms_torch = (data_torch ** 2).sum(dim=1)
+        data_norms_torch = (data_torch**2).sum(dim=1)
 
         # We'll do a chunked assignment pass, similar to the main loop, but no centroid updates
         centroids_torch = torch.from_numpy(self.centroids)
         centroids_torch = centroids_torch.to(device=self.device, dtype=torch.float32)
-        centroid_norms = (centroids_torch ** 2).sum(dim=1)
+        centroid_norms = (centroids_torch**2).sum(dim=1)
 
         n_samples = data_torch.shape[0]
-        labels = torch.empty(n_samples, dtype=torch.long, device='cpu')
+        labels = torch.empty(n_samples, dtype=torch.long, device="cpu")
 
         start_idx = 0
         while start_idx < n_samples:
             end_idx = min(start_idx + self.chunk_size_data, n_samples)
 
             data_chunk = data_torch[start_idx:end_idx].to(device=self.device, dtype=torch.float32, non_blocking=True)
-            data_chunk_norms = data_norms_torch[start_idx:end_idx].to(device=self.device, dtype=torch.float32, non_blocking=True)
+            data_chunk_norms = data_norms_torch[start_idx:end_idx].to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
             batch_size = data_chunk.size(0)
             best_ids = torch.zeros((batch_size,), device=self.device, dtype=torch.long)
 
             if self.use_triton:
-                chunked_kmeans_kernel(
+                triton_kmeans(
                     data_chunk,
                     data_chunk_norms,
                     centroids_torch,
@@ -309,7 +324,7 @@ class FastKMeans:
                     best_ids,
                 )
             else:
-                best_dist = torch.full((batch_size,), float('inf'), device=self.device, dtype=torch.float32)
+                best_dist = torch.full((batch_size,), float("inf"), device=self.device, dtype=torch.float32)
                 c_start = 0
                 k = centroids_torch.shape[0]
                 while c_start < k:
@@ -323,10 +338,10 @@ class FastKMeans:
                     local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
                     improved_mask = local_min_vals < best_dist
                     best_dist[improved_mask] = local_min_vals[improved_mask]
-                    best_ids[improved_mask] = (c_start + local_min_ids[improved_mask])
+                    best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
                     c_start = c_end
 
-            labels[start_idx:end_idx] = best_ids.to('cpu')
+            labels[start_idx:end_idx] = best_ids.to("cpu")
             start_idx = end_idx
 
         return labels.numpy()
