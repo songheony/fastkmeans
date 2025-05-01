@@ -32,6 +32,7 @@ else:
 # ~us~
 import fastkmeans
 from fastkmeans import FastKMeans
+from fastkmeans.kmeans import HAS_TRITON, _is_bfloat16_supported
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]}, pretty_exceptions_show_locals=False)
 
@@ -193,6 +194,7 @@ def evaluate_clustering(true_labels, predicted_labels, method_name):
     print(f"[{method_name}] Evaluation Metrics:")
     print(f"  Normalized Mutual Info (NMI): {nmi:.4f}")
     return nmi
+
 def plot_results(benchmarks, results, export_plots=True, device="cpu", random_clusters=False, do_evals=False):
     """Plot benchmark results."""
     if not export_plots:
@@ -222,23 +224,23 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
             valid_times = []
             valid_datasets = []
             oom_index = None
-            
+
             for i, time_value in enumerate(results[method]['times']):
                 if time_value == 'OOM':
                     oom_index = i - 1 if i > 0 else None
                     break
                 valid_times.append(time_value)
                 valid_datasets.append(datasets[i])
-            
+
             # Plot valid times
             plt.plot(valid_datasets, valid_times, marker='o', linewidth=2, label=method)
-            
+
             # Add red cross for OOM if applicable
             if oom_index is not None and oom_index >= 0:
                 plt.plot(valid_datasets[-1], valid_times[-1], 'rx', markersize=12, markeredgewidth=3)
-                plt.annotate('OOM afterwards', 
+                plt.annotate('OOM afterwards',
                              xy=(valid_datasets[-1], valid_times[-1]),
-                             xytext=(10, 10), 
+                             xytext=(10, 10),
                              textcoords='offset points',
                              color='red',
                              fontweight='bold')
@@ -247,7 +249,8 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
     plt.xlabel('Dataset (samples-clusters)', fontsize=14)
     plt.ylabel('Time (seconds)', fontsize=14)
     plt.xticks(rotation=45)
-    plt.legend(fontsize=12)
+    if do_evals:
+        plt.legend(fontsize=12)
     plt.tight_layout()
     plt.savefig(f"benchmark_plots/execution_times_{device}_{cluster_type}.png", dpi=300)
     plt.close()
@@ -261,23 +264,23 @@ def plot_results(benchmarks, results, export_plots=True, device="cpu", random_cl
                 valid_nmi = []
                 valid_datasets = []
                 oom_index = None
-                
+
                 for i, nmi_value in enumerate(results[method]['nmi']):
                     if nmi_value == 'OOM':
                         oom_index = i - 1 if i > 0 else None
                         break
                     valid_nmi.append(nmi_value)
                     valid_datasets.append(datasets[i])
-                
+
                 # Plot valid NMI scores
                 plt.plot(valid_datasets, valid_nmi, marker='o', linewidth=2, label=method)
-                
+
                 # Add red cross for OOM if applicable
                 if oom_index is not None and oom_index >= 0:
                     plt.plot(valid_datasets[-1], valid_nmi[-1], 'rx', markersize=12, markeredgewidth=3)
-                    plt.annotate('OOM afterwards', 
+                    plt.annotate('OOM afterwards',
                                  xy=(valid_datasets[-1], valid_nmi[-1]),
-                                 xytext=(10, 10), 
+                                 xytext=(10, 10),
                                  textcoords='offset points',
                                  color='red',
                                  fontweight='bold')
@@ -300,9 +303,9 @@ def main(
     verbose: Annotated[bool, Option(help="Enable verbose output")] = False,
     do_pytorch_fast_kmeans: Annotated[bool, Option("--do-pytorch-fast-kmeans", help="Run fast-pytorch-kmeans implementation")] = False,
     do_sklearn: Annotated[bool, Option("--do-sklearn", help="Run scikit-learn implementation")] = False,
-    do_big_sklearn: Annotated[bool, Option("--do-big-sklearn", help="Run sklearn even for the big datasets")] = False,
     do_faiss: Annotated[bool, Option("--do-faiss", help="Run Faiss implementation")] = False,
-    do_fastkmeans: Annotated[bool, Option("--do-fastkmeans", help="Run our FastKMeans implementation, both PyTorch and Triton (if supported)")] = False,
+    do_fastkmeans: Annotated[bool, Option("--do-fastkmeans", help="Run our PyTorch FastKMeans implementation")] = False,
+    do_fastkmeans_triton: Annotated[bool, Option("--do-fastkmeans-triton", help="Run our Triton FastKMeans implementation")] = False,
     device: Annotated[Optional[str], Option(help="Device to use ('cpu', 'cuda', etc.). Defaults to GPU if available.")] = None,
     export_plots: Annotated[bool, Option(help="Export plots of benchmark results")] = True,
     max_iters: Annotated[int, Option(help="Maximum number of iterations")] = 10,
@@ -311,8 +314,10 @@ def main(
     do_evals: Annotated[bool, Option(help="Perform evaluation metrics")] = False,
     random_clusters: Annotated[bool, Option(help="Generate random clusters instead of structured clusters")] = False,
     do_only_small: Annotated[bool, Option(help="Run only on small datasets")] = False,
+    warmup: Annotated[bool, Option(help="Warmup the the kernels before benchmarking")] = True,
 ):
     """Run KMeans benchmarks with various implementations."""
+    did_warmup = warmup
     device = fastkmeans.kmeans._get_device(device)
 
     # Set random seeds for reproducibility
@@ -322,18 +327,26 @@ def main(
         torch.cuda.manual_seed_all(seed)
 
     # Define benchmark configurations
-    def colbert_partition_counter(n_docs): return int(2 ** np.floor(np.log2(16 * np.sqrt(n_docs*300))))
-    def colbert_sampler(n_docs): return (16 * np.sqrt(120 * n_docs))
+    def colbert_partition_counter(n_docs):
+        return int(2 ** np.floor(np.log2(16 * np.sqrt(n_docs*300))))
+    def colbert_sampler(n_docs):
+        return (16 * np.sqrt(120 * n_docs))
+    def append_results(results, method, time, nmi):
+        if not warmup:
+            results[method]['times'].append(time)
+            results[method]['nmi'].append(nmi)
 
     # This will cover the most common ColBERT uses: 8192, 16384, 32768, 65536 and 131072 clusters. Anything larger should reasonably be done multi-GPU using faiss.
     n_docs = [100, 1000, 100_000, 500_000, 5_000_000]
+
+    if warmup:
+        n_docs.insert(0, 100)
 
     if do_only_small:
         n_docs = n_docs[:-2]
 
     benchmarks = []
     for n in n_docs:
-        sampled_passages = colbert_partition_counter(colbert_sampler(n))
         benchmarks.append((colbert_partition_counter(colbert_sampler(n))*100, colbert_partition_counter(colbert_sampler(n))))
     # Sort benchmarks by number of samples for easier interpretation
     benchmarks.sort(key=lambda x: (x[0], x[1]))
@@ -341,7 +354,7 @@ def main(
     # Store results for plotting
     results = {
         'Faiss': {'times': []},
-        'FastKMeans': {'times': []},
+        'FastKMeans_pytorch': {'times': []},
         'FastKMeans_triton': {'times': []},
         'Fast PyTorch KMeans': {'times': []},
         'scikit-learn': {'times': []}
@@ -353,7 +366,10 @@ def main(
 
     for n_samples, n_clusters in benchmarks:
         print(f"\n{'='*50}")
-        print(f"BENCHMARK: {n_samples} samples, {n_clusters} clusters")
+        if warmup:
+            print(f"WARMUP: {n_samples} samples, {n_clusters} clusters")
+        else:
+            print(f"BENCHMARK: {n_samples} samples, {n_clusters} clusters")
         print(f"{'='*50}")
 
         X, y = generate_synthetic_data(n_samples, n_clusters, n_features, seed, random_clusters)
@@ -368,8 +384,7 @@ def main(
             )
             if do_evals:
                 nmi = evaluate_clustering(y, labels_faiss, "Faiss KMeans")
-                results['Faiss']['times'].append(time_faiss)
-                results['Faiss']['nmi'].append(nmi)
+                append_results(results, 'Faiss', time_faiss, nmi)
 
         if do_fastkmeans:
             # Not necessary to run -- OOMs on larger cluster sizes and the minibatching implementation creates very bad clusters.
@@ -386,30 +401,30 @@ def main(
             )
             if do_evals:
                 nmi = evaluate_clustering(y, labels_torch, "PyTorch FastKMeans")
-                results['FastKMeans']['times'].append(time_torch)
-                results['FastKMeans']['nmi'].append(nmi)
-
-            if torch.cuda.is_bf16_supported():
-                _, labels_torch, time_torch = run_fastkmeans(
-                    X,
-                    n_clusters,
-                    max_iters,
-                    seed,
-                    max_points_per_centroid=max_points_per_centroid,
-                    verbose=verbose,
-                    device=device,
-                    use_triton=True,
-                    do_evals=do_evals
-                )
-                if do_evals:
-                    nmi = evaluate_clustering(y, labels_torch, "Triton FastKMeans")
-                    results['FastKMeans_triton']['times'].append(time_torch)
-                    results['FastKMeans_triton']['nmi'].append(nmi)
-            else:
-                del results['FastKMeans_triton']
+                append_results(results, 'FastKMeans_pytorch', time_torch, nmi)
         else:
-            del results['FastKMeans']
-            del results['FastKMeans_triton']
+            results.pop('FastKMeans_pytorch', None)
+
+        if do_fastkmeans_triton and _is_bfloat16_supported(device) and HAS_TRITON:
+            _, labels_torch, time_torch = run_fastkmeans(
+                X,
+                n_clusters,
+                max_iters,
+                seed,
+                max_points_per_centroid=max_points_per_centroid,
+                verbose=verbose,
+                device=device,
+                use_triton=True,
+                do_evals=do_evals
+            )
+            if do_evals:
+                nmi = evaluate_clustering(y, labels_torch, "Triton FastKMeans")
+                append_results(results, 'FastKMeans_triton', time_torch, nmi)
+        elif do_fastkmeans_triton:
+            print("Triton FastKMeans not supported on this device, check your Triton installation.")
+            results.pop('FastKMeans_triton', None)
+        else:
+            results.pop('FastKMeans_triton', None)
 
         if do_pytorch_fast_kmeans and fast_pytorch_kmeans_available and torch.cuda.is_available():
             try:
@@ -423,10 +438,7 @@ def main(
                 if do_evals: results['Fast PyTorch KMeans']['nmi'].append(0.)
             if do_evals:
                 nmi = evaluate_clustering(y, labels_fast_pytorch_kmeans, "Fast PyTorch KMeans")
-                results['Fast PyTorch KMeans']['times'].append(time_fast_pytorch)
-                results['Fast PyTorch KMeans']['nmi'].append(nmi)
-
-        max_sklearn_samples = 500_000 if not do_big_sklearn else 100_000_000
+                append_results(results, 'Fast PyTorch KMeans', time_fast_pytorch, nmi)
 
         if do_sklearn:  # Skip for the larger runs because it is _exceedingly_ slow
             _, labels_sklearn, time_sklearn = run_sklearn_kmeans(
@@ -434,8 +446,13 @@ def main(
             )
             if do_evals:
                 nmi = evaluate_clustering(y, labels_sklearn, "scikit-learn KMeans")
-                results['scikit-learn']['times'].append(time_sklearn)
-                results['scikit-learn']['nmi'].append(nmi)
+                append_results(results, 'scikit-learn', time_sklearn, nmi)
+
+        if warmup:
+            warmup = False
+
+    if did_warmup:
+        benchmarks.pop(0)
 
     # Plot results
     plot_results(benchmarks, results, export_plots, device, random_clusters, do_evals)
