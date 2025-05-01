@@ -1,7 +1,7 @@
 import time
 
-import numpy as np
 import torch
+import numpy as np
 
 try:
     from fastkmeans.triton_kernels import triton_kmeans
@@ -206,8 +206,8 @@ class FastKMeans:
         tol: float = 1e-8,
         gpu: bool = True,
         seed: int = 0,
-        max_points_per_centroid: int = 256,
-        chunk_size_data: int = 102_400,
+        max_points_per_centroid: int = 1_000_000_000,
+        chunk_size_data: int = 51_200,
         chunk_size_centroids: int = 10_240,
         device: str | int | torch.device | None = None,
         dtype: torch.dtype = None,
@@ -229,7 +229,7 @@ class FastKMeans:
         self.dtype = dtype
         self.pin_gpu_memory = pin_gpu_memory
         self.verbose = verbose
-        if use_triton is not False:
+        if use_triton is None:
             # assume triton kernel is supported if GPU supports bfloat16
             use_triton = HAS_TRITON and _is_bfloat16_supported(self.device)
         if use_triton and not HAS_TRITON:
