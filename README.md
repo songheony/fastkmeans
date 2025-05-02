@@ -66,3 +66,19 @@ While the Triton kernel uses significantly less memory than the PyTorch implemen
 Below is `fastkmeans` benchmarked against `faiss` on a single RTX 4090 GPU, with 128-dimensional data points at various data scales that will commonly be used in ColBERT-style indexing (8192, 16384, 32768, 65536, and 131072 clusters, each with w/ cluster_size*100 data points).
 
 ![fastkmeans benchmark](./benchmark_plots/4090_benchmark.png)
+
+#### Benchmarking
+
+To benchmark `fastkmeans` against `faiss` on your own machine, install faiss and PyTorch 2.5 via the `bench_env.yaml` Conda environment:
+
+```bash
+conda env create -f bench_env.yaml
+conda activate fastkmeans
+pip install fastkmeans
+```
+
+Then, run the benchmark script:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python speedbench.py --do-faiss --do-fastkmeans --do-fastkmeans-triton --do-evals
+```
