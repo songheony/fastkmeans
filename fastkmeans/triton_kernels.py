@@ -1,105 +1,132 @@
+from contextlib import contextmanager
+
 import torch
 import triton
 import triton.language as tl
 
 
+@contextmanager
+def device_guard(tensor: torch.Tensor):
+    """Context manager to ensure that the Triton kernel launches on the correct device."""
+    if tensor.device.type == "cuda":  # NVIDIA or AMD/ROCm
+        with torch.cuda.device_of(tensor):
+            yield
+    elif tensor.device.type == "xpu":  # Intel GPUs
+        with torch.xpu.device_of(tensor):
+            yield
+    else:  # CPU or other back-ends
+        yield
+
+
 @triton.heuristics(
     {
-        "BLOCK_M": lambda a: 128 if a["D"] <= 128 else (64 if a["D"] <= 512 else 32),
-        "BLOCK_N": lambda a: 64 if a["D"] <= 128 else 32,
-        "num_warps": lambda a: 4 if a["D"] <= 64 else 8,
-        "num_stages": lambda a: 2 if a["D"] < 64 else 1,
+        "BLOCK_M": lambda x: 128 if x["D"] <= 384 else 64,
+        "BLOCK_N": lambda x: 128 if x["D"] <= 384 else 64,
+        "BLOCK_K": lambda x: 16 if x["D"] <= 32 or x["D"] > 384 else 32,
+        "GROUP_SIZE_M": lambda x: 8 if x["D"] <= 32 else 16,
+        "num_warps": lambda x: 4,
     }
 )
 @triton.jit
-def _chunked_kmeans_kernel(
-    data_ptr,  # [B, D], row-major
-    x_norm_ptr,  # [B], precomputed L2 norms of data
-    centroids_ptr,  # [C, D], row-major
-    centroids_sqnorm_ptr,  # [C], precomputed L2 norms of centroids
-    best_ids_ptr,  # [B], int32 (to store best centroid indices)
-    B,  # number of data points
-    C,  # number of centroids
-    D: tl.constexpr,  # dimension, or number of features
+def _kmeans_kernel(
+    x_ptr,
+    x_norm_ptr,
+    c_ptr,
+    c_norm_ptr,
+    best_dist_ptr,
+    best_idx_ptr,
+    B,
+    C,
+    D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    """
-    Each Triton block processes BLOCK_M rows of data. The kernel:
-      1) loads those rows (and their precomputed norms from x_norm_ptr),
-      2) loops over all centroids in chunks of BLOCK_N,
-      3) computes distances, finds the best centroid,
-      4) writes out the best centroid index for each data point.
-    """
-    # 1) Identify which data rows this block handles
-    block_id = tl.program_id(axis=0)
-    row_start = block_id * BLOCK_M
+    # Map flat CTA id to (pid_m, pid_n) in “grouped” launch order
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(B, BLOCK_M)  # row-tiles
+    num_pid_n = tl.cdiv(C, BLOCK_N)  # centroid-tiles
+
+    # Super-group into GROUP_SIZE_M blocks to minimize loading from global memory
+    num_pid_in_grp = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (pid // num_pid_in_grp) * GROUP_SIZE_M
+    group_rows = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+
+    pid_m = first_pid_m + ((pid % num_pid_in_grp) % group_rows)  # row-tile index
+    pid_n = (pid % num_pid_in_grp) // group_rows  # centroid-tile index
+
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * BLOCK_N
+
     rows = row_start + tl.arange(0, BLOCK_M)
-    mask = rows < B
+    cols = col_start + tl.arange(0, BLOCK_N)
 
-    # 2) Load data rows and precomputed x_norm: shape [BLOCK_M, D]
-    row_offsets = rows[:, None] * D + tl.arange(0, D)
-    x = tl.load(data_ptr + row_offsets, mask=mask[:, None], other=0.0)
+    row_mask = rows < B
+    col_mask = cols < C
 
-    # shape: [BLOCK_M]
-    x_norm = tl.load(x_norm_ptr + rows, mask=mask, other=0.0)
+    # load norms
+    x_n = tl.load(x_norm_ptr + rows, mask=row_mask, other=0.0)  # [BM]
+    c_n = tl.load(c_norm_ptr + cols, mask=col_mask, other=0.0)  # [BN]
 
-    # Prepare "best distance" + "best index"
-    best_dist = tl.full([BLOCK_M], 1e38, dtype=tl.float32)
-    best_idx = tl.zeros([BLOCK_M], dtype=tl.int64)
+    # pipelined K‑loop, will hold partial dot‑products in registers
+    dot_acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
 
-    # 3) Iterate over the centroids in chunks of BLOCK_N
-    for chunk in range(0, C, BLOCK_N):
-        cids = chunk + tl.arange(0, BLOCK_N)
-        c_mask = cids < C
+    # compute matmul tiled across SMs
+    for k0 in range(0, D, BLOCK_K):
+        k_range = k0 + tl.arange(0, BLOCK_K)
 
-        # Load sub-block of centroids: shape [BLOCK_N, D]
-        c_offsets = cids[:, None] * D + tl.arange(0, D)
-        cvals = tl.load(centroids_ptr + c_offsets, mask=c_mask[:, None], other=0.0).to(x.dtype)
+        # load X slice
+        x_ptrs = x_ptr + rows[:, None] * D + k_range[None, :]
+        xk = tl.load(x_ptrs, mask=row_mask[:, None]).to(tl.float16)
 
-        # Load centroid norms: shape [BLOCK_N]
-        c_sqnorm = tl.load(centroids_sqnorm_ptr + cids, mask=c_mask, other=0.0).to(x.dtype)
+        # load C slice
+        c_ptrs = c_ptr + cols[:, None] * D + k_range[None, :]
+        ck = tl.load(c_ptrs, mask=col_mask[:, None]).to(tl.float16)
 
-        # Compute distance = x_norm + c_sqnorm - 2 * dot(x, c)
-        dots = tl.dot(x, tl.trans(cvals))  # shape [BLOCK_M, BLOCK_N]
-        dist_chunk = tl.fma(dots, -2.0, x_norm[:, None] + c_sqnorm[None, :])
+        # accumulate
+        dot_acc += tl.dot(xk, tl.trans(ck), out_dtype=tl.float32)
 
-        # Find the argmin along the BLOCK_N dimension
-        local_min_vals, local_min_idx = tl.min(dist_chunk, axis=1, return_indices=True)
+    # finish distance formula
+    dist = tl.fma(dot_acc, -2.0, x_n[:, None] + c_n[None, :])  # [BM, BN]
 
-        improved = local_min_vals < best_dist
-        best_dist = tl.where(improved, local_min_vals, best_dist)
-        best_idx = tl.where(improved, chunk + local_min_idx, best_idx)
+    # local arg‑min (inside this tile)
+    tile_min, tile_idx = tl.min(dist, axis=1, return_indices=True)
 
-    # 4) Write out the best centroid indices
-    tl.store(best_ids_ptr + rows, best_idx, mask=mask)
+    # compete with global best using atomics
+    prev = tl.atomic_min(best_dist_ptr + rows, tile_min, mask=row_mask)
+    improved = tile_min < prev
+
+    # update best_ids
+    tl.store(best_idx_ptr + rows, tl.where(improved, col_start + tile_idx, tl.load(best_idx_ptr + rows)), mask=row_mask)
 
 
-def chunked_kmeans_kernel(
+def triton_kmeans(
     data_chunk: torch.Tensor,
     data_chunk_norms: torch.Tensor,
     centroids: torch.Tensor,
     centroids_sqnorm: torch.Tensor,
     best_ids: torch.Tensor,
 ):
-    """
-    Launches the Triton kernel to assign each point to its nearest centroid in one pass.
-
-    best_ids: pre-allocated [B] (int32) to store the best centroid ID of each point.
-    """
     B, D = data_chunk.shape
     C = centroids.shape[0]
+    best_dist = torch.full((B,), 1e38, device=data_chunk.device, dtype=torch.float32)
 
     def grid(meta):
-        return (triton.cdiv(B, meta["BLOCK_M"]),)
+        return (triton.cdiv(B, meta["BLOCK_M"]) * triton.cdiv(C, meta["BLOCK_N"]),)  # 1D grid
 
-    _chunked_kmeans_kernel[grid](
-        data_chunk,
-        data_chunk_norms,
-        centroids,
-        centroids_sqnorm,
-        best_ids,
-        B,  # num_points
-        C,  # num_centroids
-        D,  # dimension, or number of features
-    )
+    # Without this Triton always tries to launch from device:0 and we get
+    # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+    with device_guard(data_chunk):
+        _kmeans_kernel[grid](
+            data_chunk,
+            data_chunk_norms,
+            centroids,
+            centroids_sqnorm,
+            best_dist,
+            best_ids,
+            B,
+            C,
+            D,
+        )
