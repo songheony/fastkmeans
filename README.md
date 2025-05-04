@@ -82,3 +82,15 @@ Then, run the benchmark script:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python speedbench.py --do-faiss --do-fastkmeans --do-fastkmeans-triton --do-evals
 ```
+
+### Citation
+
+If you use fastmeans and want to/need to cite it in your work, please feel free to use the citation below:
+
+```bibtex
+@misc{fastkmeans2024,
+  author = {Benjamin Clavié and Benjamin Warner},
+  title = {fastkmeans: Accelerated KMeans Clustering in PyTorch and Triton},
+  year = {2024},
+  howpublished = {\url{https://github.com/AnswerDotAI/fastkmeans/}}
+}
