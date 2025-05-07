@@ -317,7 +317,7 @@ class FastKMeans:
         chunk_size_data: int = 51_200,
         chunk_size_centroids: int = 10_240,
         device: str | int | torch.device | None = None,
-        dtype: torch.dtype = None,
+        dtype: torch.dtype = torch.half,
         pin_gpu_memory: bool = True,
         verbose: bool = False,
         nredo: int = 1,  # for compatibility only
@@ -410,6 +410,7 @@ class FastKMeans:
 
         n_samples = data_torch.shape[0]
         labels = torch.empty(n_samples, dtype=torch.long, device="cpu")
+        distances = torch.empty(n_samples, dtype=torch.float32, device="cpu")
 
         start_idx = 0
         while start_idx < n_samples:
@@ -449,9 +450,10 @@ class FastKMeans:
                     c_start = c_end
 
             labels[start_idx:end_idx] = best_ids.to("cpu")
+            distances[start_idx:end_idx] = best_dist.to("cpu")
             start_idx = end_idx
 
-        return labels.numpy()
+        return labels.numpy(), distances.numpy()
 
     def fit_predict(self, data: np.ndarray) -> np.ndarray:
         """
@@ -497,7 +499,7 @@ class StreamingFastKMeans:
         seed: int = 0,
         chunk_size_centroids: int = 10_240,
         device: str | int | torch.device | None = None,
-        dtype: torch.dtype = None,
+        dtype: torch.dtype = torch.half,
         pin_gpu_memory: bool = True,
         verbose: bool = False,
         nredo: int = 1,  # for compatibility only
@@ -573,6 +575,7 @@ class StreamingFastKMeans:
         centroids_torch = centroids_torch.to(device=self.device, dtype=torch.float32)
         centroid_norms = (centroids_torch**2).sum(dim=1)
 
+        mappings = []
         labels = []
         for group_names, slide_hashs, dataset_names, features in tqdm(dataloader):
             data_chunk = features.to(device=device, dtype=dtype, non_blocking=True)
@@ -608,8 +611,17 @@ class StreamingFastKMeans:
 
             labels.append(best_ids.to("cpu"))
 
+            for group_name, slide_hash, dataset_name in zip(group_names, slide_hashs, dataset_names):
+                mappings.append(
+                    {
+                        "group_name": group_name,
+                        "slide_hash": slide_hash,
+                        "dataset_name": dataset_name,
+                    }
+                )
+
         labels = torch.cat(labels, dim=0)
-        return labels.numpy()
+        return labels.numpy(), mappings
 
     def fit_predict(self, dataloader: np.ndarray) -> np.ndarray:
         """
