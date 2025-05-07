@@ -198,7 +198,16 @@ def _streaming_kmeans_torch_double_chunked(
         dtype = torch.float16 if device.type in ["cuda", "xpu"] else torch.float32
 
     # centroid init -- random is the only supported init
-    centroids = dataloader.dataset.get_random_features(k)
+    chunks, total = [], 0
+    for _, _, features in tqdm(dataloader):
+        chunks.append(features)
+        total += features.shape[0]
+
+        if total > k * 10:
+            break
+
+    centroids = torch.cat(chunks, dim=0)
+    centroids = centroids[torch.randperm(centroids.shape[0])[:k]]
     centroids = centroids.to(device=device, dtype=dtype)
     prev_centroids = centroids.clone()
 
@@ -209,7 +218,7 @@ def _streaming_kmeans_torch_double_chunked(
         cluster_sums = torch.zeros((k, d), device=device, dtype=torch.float32)
         cluster_counts = torch.zeros((k,), device=device, dtype=torch.float32)
 
-        for _, _, _, features in tqdm(dataloader):
+        for _, _, features in tqdm(dataloader):
             data_chunk = features.to(device=device, dtype=dtype, non_blocking=True)
             data_chunk_norms = (data_chunk**2).sum(dim=1)
             batch_size = data_chunk.size(0)
@@ -577,7 +586,7 @@ class StreamingFastKMeans:
 
         mappings = []
         labels = []
-        for group_names, slide_hashs, dataset_names, features in tqdm(dataloader):
+        for slide_hashs, dataset_names, features in tqdm(dataloader):
             data_chunk = features.to(device=device, dtype=dtype, non_blocking=True)
             data_chunk_norms = (data_chunk**2).sum(dim=1)
             batch_size = data_chunk.size(0)
@@ -611,10 +620,9 @@ class StreamingFastKMeans:
 
             labels.append(best_ids.to("cpu"))
 
-            for group_name, slide_hash, dataset_name in zip(group_names, slide_hashs, dataset_names):
+            for slide_hash, dataset_name in zip(slide_hashs, dataset_names):
                 mappings.append(
                     {
-                        "group_name": group_name,
                         "slide_hash": slide_hash,
                         "dataset_name": dataset_name,
                     }
