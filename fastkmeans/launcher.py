@@ -1,6 +1,20 @@
-import os, torch, torch.multiprocessing as mp
+import os
+import socket
+
+import torch
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
 from fastkmeans import FastKMeans
+
+
+def _setup_master_env():
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+    if "MASTER_PORT" not in os.environ:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        os.environ["MASTER_PORT"] = str(s.getsockname()[1])
+        s.close()
 
 
 def _make_loader(ds, rank, world_size, dl_kwargs):
@@ -59,6 +73,7 @@ def distributed_fit(build_dataset,
     dataloader_kwargs = {} if dataloader_kwargs is None else dataloader_kwargs
     queue = mp.Queue()
 
+    _setup_master_env()
     mp.start_processes(
         _worker_fit,
         args=(num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue),
@@ -80,6 +95,7 @@ def distributed_predict(build_dataset,
     dataloader_kwargs = {} if dataloader_kwargs is None else dataloader_kwargs
     queue = mp.Queue()
 
+    _setup_master_env()
     mp.start_processes(
         _worker_predict,
         args=(num_gpus, build_dataset, build_kmeans, dataloader_kwargs, centroids, queue),
