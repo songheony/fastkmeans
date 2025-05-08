@@ -59,10 +59,13 @@ def distributed_fit(build_dataset,
     dataloader_kwargs = {} if dataloader_kwargs is None else dataloader_kwargs
     queue = mp.Queue()
 
-    mp.spawn(_worker_fit,
-             args=(num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue),
-             nprocs=num_gpus,
-             join=True)
+    mp.start_processes(
+        _worker_fit,
+        args=(num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue),
+        nprocs=num_gpus,
+        join=True,
+        start_method="fork",
+    )
 
     return queue.get()
 
@@ -77,10 +80,12 @@ def distributed_predict(build_dataset,
     dataloader_kwargs = {} if dataloader_kwargs is None else dataloader_kwargs
     queue = mp.Queue()
 
-    mp.spawn(_worker_predict,
-             args=(num_gpus, build_dataset, build_kmeans,
-                   dataloader_kwargs, centroids, queue),
-             nprocs=num_gpus,
-             join=True)
+    mp.start_processes(
+        _worker_predict,
+        args=(num_gpus, build_dataset, build_kmeans, dataloader_kwargs, centroids, queue),
+        nprocs=num_gpus,
+        join=True,
+        start_method="fork",
+    )
 
     return queue.get()
