@@ -56,15 +56,16 @@ class FastKMeans:
         Maximum number of iterations.
     tol : float, default=1e-4
         Stopping threshold for centroid movement.
-    gpu : bool, default=True
-        Whether to force GPU usage if available. If False, CPU is used.
     seed : int, default=0
         Random seed for centroid initialization and (if needed) subsampling.
     chunk_size_centroids : int, default=10,240
         Chunk size along the centroid dimension for assignment/update steps.
-    use_triton : bool | None, default=None
+    dtype : torch.dtype, default=torch.half
+        Data type for the input features and centroids.
+    verbose : bool, default=False
+        If True, print progress information.
+    use_triton : bool, default=True
        Use the fast Triton backend for the assignment/update steps.
-       If None, the Triton backend will be enabled for modern GPUs.
     """
 
     def __init__(
@@ -105,7 +106,6 @@ class FastKMeans:
         device : torch.device
             Device to use for computation.
         """
-
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -126,40 +126,43 @@ class FastKMeans:
             cluster_sums = torch.zeros((self.k, self.d), device=device, dtype=torch.float32)
             cluster_counts = torch.zeros((self.k,), device=device, dtype=torch.float32)
 
-            for _, _, features in tqdm(dataloader):
-                data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
-                data_chunk_norms = (data_chunk**2).sum(dim=1)
-                batch_size = data_chunk.size(0)
-                best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+            with tqdm(description="Processing batches", disable=rank != 0) as pbar:
+                for _, _, features in dataloader:
+                    data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
+                    data_chunk_norms = (data_chunk**2).sum(dim=1)
+                    batch_size = data_chunk.size(0)
+                    best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
-                if self.use_triton:
-                    triton_kmeans(
-                        data_chunk=data_chunk,
-                        data_chunk_norms=data_chunk_norms,
-                        centroids=centroids,
-                        centroids_sqnorm=centroid_norms,
-                        best_ids=best_ids,
-                    )
-                else:
-                    best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
-                    c_start = 0
-                    while c_start < self.k:
-                        c_end = min(c_start + self.chunk_size_centroids, self.k)
-                        centroid_chunk = centroids[c_start:c_end]
-                        centroid_chunk_norms = centroid_norms[c_start:c_end]
+                    if self.use_triton:
+                        triton_kmeans(
+                            data_chunk=data_chunk,
+                            data_chunk_norms=data_chunk_norms,
+                            centroids=centroids,
+                            centroids_sqnorm=centroid_norms,
+                            best_ids=best_ids,
+                        )
+                    else:
+                        best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
+                        c_start = 0
+                        while c_start < self.k:
+                            c_end = min(c_start + self.chunk_size_centroids, self.k)
+                            centroid_chunk = centroids[c_start:c_end]
+                            centroid_chunk_norms = centroid_norms[c_start:c_end]
 
-                        dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
-                        dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
+                            dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
+                            dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
 
-                        local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
-                        improved_mask = local_min_vals < best_dist
-                        best_dist[improved_mask] = local_min_vals[improved_mask]
-                        best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
+                            local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
+                            improved_mask = local_min_vals < best_dist
+                            best_dist[improved_mask] = local_min_vals[improved_mask]
+                            best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
 
-                        c_start = c_end
+                            c_start = c_end
 
-                cluster_sums.index_add_(0, best_ids, data_chunk.float())
-                cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
+                    cluster_sums.index_add_(0, best_ids, data_chunk.float())
+                    cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
+
+                    pbar.update(1)
 
             if dist.is_initialized():
                 dist.all_reduce(cluster_sums, op=dist.ReduceOp.SUM)
@@ -232,46 +235,50 @@ class FastKMeans:
 
         mappings = []
         labels = []
-        for slide_hashs, dataset_names, features in tqdm(dataloader):
-            data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
-            data_chunk_norms = (data_chunk**2).sum(dim=1)
-            batch_size = data_chunk.size(0)
-            best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
-            if self.use_triton:
-                triton_kmeans(
-                    data_chunk,
-                    data_chunk_norms,
-                    centroids_torch,
-                    centroid_norms,
-                    best_ids,
-                )
-            else:
-                best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
-                c_start = 0
-                while c_start < self.k:
-                    c_end = min(c_start + self.chunk_size_centroids, self.k)
-                    centroid_chunk = centroids_torch[c_start:c_end]
-                    centroid_chunk_norms = centroid_norms[c_start:c_end]
+        with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
+            for slide_hashs, dataset_names, features in dataloader:
+                data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
+                data_chunk_norms = (data_chunk**2).sum(dim=1)
+                batch_size = data_chunk.size(0)
+                best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
-                    dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
-                    dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
+                if self.use_triton:
+                    triton_kmeans(
+                        data_chunk,
+                        data_chunk_norms,
+                        centroids_torch,
+                        centroid_norms,
+                        best_ids,
+                    )
+                else:
+                    best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
+                    c_start = 0
+                    while c_start < self.k:
+                        c_end = min(c_start + self.chunk_size_centroids, self.k)
+                        centroid_chunk = centroids_torch[c_start:c_end]
+                        centroid_chunk_norms = centroid_norms[c_start:c_end]
 
-                    local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
-                    improved_mask = local_min_vals < best_dist
-                    best_dist[improved_mask] = local_min_vals[improved_mask]
-                    best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
-                    c_start = c_end
+                        dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
+                        dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
 
-            labels.append(best_ids.cpu())
+                        local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
+                        improved_mask = local_min_vals < best_dist
+                        best_dist[improved_mask] = local_min_vals[improved_mask]
+                        best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
+                        c_start = c_end
 
-            for slide_hash, dataset_name in zip(slide_hashs, dataset_names):
-                mappings.append(
-                    {
-                        "slide_hash": slide_hash,
-                        "dataset_name": dataset_name,
-                    }
-                )
+                labels.append(best_ids.cpu())
+
+                for slide_hash, dataset_name in zip(slide_hashs, dataset_names):
+                    mappings.append(
+                        {
+                            "slide_hash": slide_hash,
+                            "dataset_name": dataset_name,
+                        }
+                    )
+
+                pbar.update(1)
 
         labels = torch.cat(labels, dim=0).numpy()
 
