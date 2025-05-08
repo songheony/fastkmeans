@@ -1,4 +1,4 @@
-from .kmeans import FastKMeans, StreamingFastKMeans
+from .kmeans import FastKMeans
 
-__all__ = ["FastKMeans", "StreamingFastKMeans"]
+__all__ = ["FastKMeans"]
 __version__ = "0.4.0"
