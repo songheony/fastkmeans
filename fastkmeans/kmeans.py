@@ -1,6 +1,7 @@
 import time
 
 import torch
+import torch.distributed as dist
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -14,141 +15,30 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _get_device(preset: str | int | torch.device | None = None):
-    if isinstance(preset, torch.device):
-        return preset
-    if isinstance(preset, str):
-        return torch.device(preset)
-    if torch.cuda.is_available():  # cuda currently handles both AMD and NVIDIA GPUs
-        return torch.device(f"cuda:{preset if isinstance(preset, int) and preset < torch.cuda.device_count() else 0}")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device(f"xpu:{preset if isinstance(preset, int) and preset < torch.xpu.device_count() else 0}")
-    return torch.device("cpu")
-
-
-def _is_bfloat16_supported(device: torch.device):
-    if device.type == "cuda":
-        return torch.cuda.is_bf16_supported()
-    elif device.type == "xpu" and hasattr(torch.xpu, "is_bf16_supported"):
-        return torch.xpu.is_bf16_supported()
-    else:
-        return False
-
-
-@torch.inference_mode()
-def _kmeans_torch_double_chunked(
-    dataloader: DataLoader,
-    d: int,
-    k: int,
-    device: torch.device,
-    dtype: torch.dtype | None = None,
-    max_iters: int = 25,
-    tol: float = 1e-8,
-    chunk_size_centroids: int = 10_000,
-    verbose: bool = False,
-    use_triton: bool | None = None,
-):
+def _get_random_features(dataloader: DataLoader, n_samples: int) -> torch.Tensor:
     """
-    An efficient kmeans implementation that minimises OOM risks on modern hardware by using conversative double chunking.
+    Returns a random sample of features from the dataloader.
+
+    Parameters
+    ----------
+    dataloader : DataLoader
+        Dataloader to sample from.
+    n_samples : int
+        Number of samples to return.
 
     Returns
     -------
-    centroids_cpu : torch.Tensor, shape (k, n_features), float32
+    torch.Tensor
+        Randomly sampled features.
     """
-
-    if use_triton:
-        if not HAS_TRITON:
-            raise ImportError("Triton is not available. Please install Triton and try again.")
-
-    if dtype is None:
-        dtype = torch.float16 if device.type in ["cuda", "xpu"] else torch.float32
-
-    # centroid init -- random is the only supported init
     chunks, total = [], 0
-    for _, _, features in tqdm(dataloader):
+    for _, _, features in dataloader:
         chunks.append(features)
         total += features.shape[0]
-
-        if total > k * 10:
+        if total >= n_samples * 10:
             break
-
-    centroids = torch.cat(chunks, dim=0)
-    centroids = centroids[torch.randperm(centroids.shape[0])[:k]]
-    centroids = centroids.to(device=device, dtype=dtype)
-    prev_centroids = centroids.clone()
-
-    for iteration in range(max_iters):
-        iteration_start_time = time.time()
-
-        centroid_norms = (centroids**2).sum(dim=1)
-        cluster_sums = torch.zeros((k, d), device=device, dtype=torch.float32)
-        cluster_counts = torch.zeros((k,), device=device, dtype=torch.float32)
-
-        for _, _, features in tqdm(dataloader):
-            data_chunk = features.to(device=device, dtype=dtype, non_blocking=True)
-            data_chunk_norms = (data_chunk**2).sum(dim=1)
-            batch_size = data_chunk.size(0)
-            best_ids = torch.zeros((batch_size,), device=device, dtype=torch.int64)
-
-            if use_triton:
-                triton_kmeans(
-                    data_chunk=data_chunk,
-                    data_chunk_norms=data_chunk_norms,
-                    centroids=centroids,
-                    centroids_sqnorm=centroid_norms,
-                    best_ids=best_ids,
-                )
-            else:
-                best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=dtype)
-                c_start = 0
-                while c_start < k:
-                    c_end = min(c_start + chunk_size_centroids, k)
-                    centroid_chunk = centroids[c_start:c_end]
-                    centroid_chunk_norms = centroid_norms[c_start:c_end]
-
-                    dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
-                    dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
-
-                    local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
-                    improved_mask = local_min_vals < best_dist
-                    best_dist[improved_mask] = local_min_vals[improved_mask]
-                    best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
-
-                    c_start = c_end
-
-            cluster_sums.index_add_(0, best_ids, data_chunk.float())
-            cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, device=device, dtype=torch.float32))
-
-        new_centroids = torch.zeros_like(centroids, device=device, dtype=dtype)
-        non_empty = cluster_counts > 0
-        new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=dtype)
-
-        empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
-        if len(empty_ids) > 0:
-            random_data = dataloader.dataset.get_random_features(len(empty_ids))
-            random_data = random_data.to(device=device, dtype=dtype)
-            new_centroids[empty_ids] = random_data
-
-        shift = torch.norm(new_centroids - prev_centroids.to(new_centroids.device), dim=1).sum().item()
-        centroids = new_centroids
-
-        prev_centroids = centroids.clone()
-
-        iteration_time = time.time() - iteration_start_time
-        if verbose:
-            print(
-                f"Iteration {iteration + 1}/{max_iters} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}"
-            )
-
-        if shift < tol:
-            if verbose:
-                print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {tol})")
-            break
-
-    centroids_cpu = centroids.to("cpu", dtype=torch.float32)
-    return centroids_cpu
+    chunks = torch.cat(chunks, dim=0)
+    return chunks[torch.randperm(chunks.shape[0])[:n_samples]]
 
 
 class FastKMeans:
@@ -183,15 +73,11 @@ class FastKMeans:
         k: int,
         niter: int = 25,
         tol: float = 1e-8,
-        gpu: bool = True,
         seed: int = 0,
         chunk_size_centroids: int = 10_240,
-        device: str | int | torch.device | None = None,
         dtype: torch.dtype = torch.half,
-        pin_gpu_memory: bool = True,
         verbose: bool = False,
-        nredo: int = 1,  # for compatibility only
-        use_triton: bool | None = None,
+        use_triton: bool = True,
     ):
         self.d = d
         self.k = k
@@ -199,77 +85,158 @@ class FastKMeans:
         self.tol = tol
         self.seed = seed
         self.chunk_size_centroids = chunk_size_centroids
-        self.device = _get_device("cpu" if gpu is False else device)
-        self.centroids = None
         self.dtype = dtype
-        self.pin_gpu_memory = pin_gpu_memory
         self.verbose = verbose
-        if use_triton is None:
-            # assume triton kernel is supported if GPU supports bfloat16
-            use_triton = HAS_TRITON and _is_bfloat16_supported(self.device)
         if use_triton and not HAS_TRITON:
             raise ValueError("Triton is not available. Please install Triton and try again.")
         self.use_triton = use_triton
-        if nredo != 1:
-            raise ValueError("nredo must be 1, redos not currently supported")
 
-    def train(self, dataloader: DataLoader):
+        self.centroids = None
+
+    @torch.inference_mode()
+    def fit(self, dataloader: DataLoader, device: torch.device):
         """
-        Trains (fits) the KMeans model on the given data and sets `self.centroids`. Designed to mimic faiss's `train()` method.
+        Fits the KMeans model to the data.
 
         Parameters
         ----------
         dataloader : DataLoader
+            Dataloader to fit the model to.
+        device : torch.device
+            Device to use for computation.
         """
-        device = _get_device(self.device)
-        if device == "cuda" and self.pin_gpu_memory:
-            data_torch = data_torch.pin_memory()
-            data_norms_torch = data_norms_torch.pin_memory()
 
-        centroids = _kmeans_torch_double_chunked(
-            dataloader,
-            d=self.d,
-            k=self.k,
-            max_iters=self.niter,
-            tol=self.tol,
-            device=device,
-            dtype=self.dtype,
-            chunk_size_centroids=self.chunk_size_centroids,
-            verbose=self.verbose,
-            use_triton=self.use_triton,
-        )
-        self.centroids = centroids.numpy()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    def fit(self, dataloader: DataLoader):
-        """
-        Same as train(), included for interface similarity with scikit-learn's `fit()`.
-        """
-        self.train(dataloader)
-        return self
+        if rank == 0:
+            centroids = _get_random_features(dataloader, self.k)
+            centroids = centroids.to(device=device, dtype=self.dtype)
+            prev_centroids = centroids.clone()
+        else:
+            centroids = torch.empty((self.k, self.d), device=device, dtype=self.dtype)
 
-    def predict(self, dataloader: DataLoader) -> np.ndarray:
+        if dist.is_initialized():
+            dist.broadcast(centroids, src=0)
+
+        for iteration in range(self.niter):
+            iteration_start_time = time.time()
+
+            centroid_norms = (centroids**2).sum(dim=1)
+            cluster_sums = torch.zeros((self.k, self.d), device=device, dtype=torch.float32)
+            cluster_counts = torch.zeros((self.k,), device=device, dtype=torch.float32)
+
+            for _, _, features in tqdm(dataloader):
+                data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
+                data_chunk_norms = (data_chunk**2).sum(dim=1)
+                batch_size = data_chunk.size(0)
+                best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+
+                if self.use_triton:
+                    triton_kmeans(
+                        data_chunk=data_chunk,
+                        data_chunk_norms=data_chunk_norms,
+                        centroids=centroids,
+                        centroids_sqnorm=centroid_norms,
+                        best_ids=best_ids,
+                    )
+                else:
+                    best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
+                    c_start = 0
+                    while c_start < self.k:
+                        c_end = min(c_start + self.chunk_size_centroids, self.k)
+                        centroid_chunk = centroids[c_start:c_end]
+                        centroid_chunk_norms = centroid_norms[c_start:c_end]
+
+                        dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
+                        dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
+
+                        local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
+                        improved_mask = local_min_vals < best_dist
+                        best_dist[improved_mask] = local_min_vals[improved_mask]
+                        best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
+
+                        c_start = c_end
+
+                cluster_sums.index_add_(0, best_ids, data_chunk.float())
+                cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
+
+            if dist.is_initialized():
+                dist.all_reduce(cluster_sums, op=dist.ReduceOp.SUM)
+                dist.all_reduce(cluster_counts, op=dist.ReduceOp.SUM)
+
+            if rank == 0:
+                new_centroids = torch.zeros_like(centroids)
+                non_empty = cluster_counts > 0
+                new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=self.dtype)
+
+                empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
+                if len(empty_ids) > 0:
+                    random_data = _get_random_features(dataloader, len(empty_ids))
+                    random_data = random_data.to(device=device, dtype=self.dtype)
+                    new_centroids[empty_ids] = random_data
+
+                shift = torch.norm(new_centroids - prev_centroids, dim=1).sum()
+
+                centroids.copy_(new_centroids)
+                prev_centroids = centroids.clone()
+            else:
+                shift = torch.zeros((1,), device=device, dtype=self.dtype)
+
+            if dist.is_initialized():
+                dist.broadcast(centroids, src=0)
+                dist.broadcast(shift, src=0)
+
+            shift = shift.item()
+
+            iteration_time = time.time() - iteration_start_time
+            if self.verbose and rank == 0:
+                print(
+                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}"
+                )
+
+            if shift < self.tol:
+                if self.verbose and rank == 0:
+                    print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {self.tol})")
+                break
+
+        if rank == 0:
+            self.centroids = centroids.cpu().numpy()
+
+    @torch.inference_mode()
+    def predict(self, dataloader: DataLoader, device: torch.device) -> tuple[np.ndarray, list]:
         """
-        Assigns each data point to the nearest centroid for even more compatibility with scikit-learn's `predict()`, which is what cool libraries do.
+        Predicts the cluster labels for the data in the dataloader.
+
+        Parameters
+        ----------
+        dataloader : DataLoader
+            Dataloader to predict the labels for.
+        device : torch.device
+            Device to use for computation.
 
         Returns
         -------
-        labels : np.ndarray of shape (n_samples,), int64
+        tuple[np.ndarray, list]
+            Tuple containing the predicted labels and a list of mappings.
         """
         if self.centroids is None:
             raise RuntimeError("Must call train() or fit() before predict().")
 
-        # We'll do a chunked assignment pass, similar to the main loop, but no centroid updates
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+
         centroids_torch = torch.from_numpy(self.centroids)
-        centroids_torch = centroids_torch.to(device=self.device, dtype=torch.float32)
+        centroids_torch = centroids_torch.to(device=device, dtype=self.dtype)
         centroid_norms = (centroids_torch**2).sum(dim=1)
 
         mappings = []
         labels = []
         for slide_hashs, dataset_names, features in tqdm(dataloader):
-            data_chunk = features.to(device=device, dtype=dtype, non_blocking=True)
+            data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
             data_chunk_norms = (data_chunk**2).sum(dim=1)
             batch_size = data_chunk.size(0)
-            best_ids = torch.zeros((batch_size,), device=self.device, dtype=torch.long)
+            best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
             if self.use_triton:
                 triton_kmeans(
@@ -280,11 +247,10 @@ class FastKMeans:
                     best_ids,
                 )
             else:
-                best_dist = torch.full((batch_size,), float("inf"), device=self.device, dtype=torch.float32)
+                best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=self.dtype)
                 c_start = 0
-                k = centroids_torch.shape[0]
-                while c_start < k:
-                    c_end = min(c_start + self.chunk_size_centroids, k)
+                while c_start < self.k:
+                    c_end = min(c_start + self.chunk_size_centroids, self.k)
                     centroid_chunk = centroids_torch[c_start:c_end]
                     centroid_chunk_norms = centroid_norms[c_start:c_end]
 
@@ -297,7 +263,7 @@ class FastKMeans:
                     best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
                     c_start = c_end
 
-            labels.append(best_ids.to("cpu"))
+            labels.append(best_ids.cpu())
 
             for slide_hash, dataset_name in zip(slide_hashs, dataset_names):
                 mappings.append(
@@ -307,12 +273,18 @@ class FastKMeans:
                     }
                 )
 
-        labels = torch.cat(labels, dim=0)
-        return labels.numpy(), mappings
+        labels = torch.cat(labels, dim=0).numpy()
 
-    def fit_predict(self, dataloader: np.ndarray) -> np.ndarray:
-        """
-        Chains fit and predict, once again inspired by the great scikit-learn.
-        """
-        self.fit(dataloader)
-        return self.predict(dataloader)
+        if dist.is_initialized():
+            pack = {"labels": labels, "mappings": mappings}
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, pack)
+
+            if rank == 0:
+                labels = np.concatenate([g["labels"] for g in gathered], axis=0)
+                mappings = sum([g["mappings"] for g in gathered], [])
+                return labels, mappings
+            else:
+                return None, None
+        else:
+            return labels, mappings
