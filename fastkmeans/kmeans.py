@@ -235,6 +235,7 @@ class FastKMeans:
 
         mappings = []
         labels = []
+        distances = []
 
         with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
             for slide_hashs, dataset_names, features in dataloader:
@@ -269,6 +270,7 @@ class FastKMeans:
                         c_start = c_end
 
                 labels.append(best_ids.cpu())
+                distances.append(best_dist.cpu())
 
                 for slide_hash, dataset_name in zip(slide_hashs, dataset_names):
                     mappings.append(
@@ -281,17 +283,19 @@ class FastKMeans:
                 pbar.update(1)
 
         labels = torch.cat(labels, dim=0).numpy()
+        distances = torch.cat(distances, dim=0).numpy()
 
         if dist.is_initialized():
-            pack = {"labels": labels, "mappings": mappings}
+            pack = {"labels": labels, "distances": distances, "mappings": mappings}
             gathered = [None] * world_size
             dist.all_gather_object(gathered, pack)
 
             if rank == 0:
                 labels = np.concatenate([g["labels"] for g in gathered], axis=0)
+                distances = np.concatenate([g["distances"] for g in gathered], axis=0)
                 mappings = sum([g["mappings"] for g in gathered], [])
-                return labels, mappings
+                return labels, distances, mappings
             else:
-                return None, None
+                return None, None, None
         else:
-            return labels, mappings
+            return labels, distances, mappings

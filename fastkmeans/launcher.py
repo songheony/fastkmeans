@@ -41,9 +41,9 @@ def _worker_predict(rank, world_size, build_dataset, build_kmeans, dataloader_kw
 
     km = build_kmeans()
     km.centroids = centroids
-    labels, maps = km.predict(dl, device=device)
+    labels, dists, maps = km.predict(dl, device=device)
     if rank == 0:
-        queue.put((labels, maps))
+        queue.put((labels, dists, maps))
 
     torch.distributed.destroy_process_group()
 
