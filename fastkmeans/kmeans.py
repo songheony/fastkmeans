@@ -126,7 +126,7 @@ class FastKMeans:
             cluster_sums = torch.zeros((self.k, self.d), device=device, dtype=torch.float32)
             cluster_counts = torch.zeros((self.k,), device=device, dtype=torch.float32)
 
-            with tqdm(description="Processing batches", disable=rank != 0) as pbar:
+            with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
                 for _, _, features in dataloader:
                     data_chunk = features.to(device=device, dtype=self.dtype, non_blocking=True)
                     data_chunk_norms = (data_chunk**2).sum(dim=1)
