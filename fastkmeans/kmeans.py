@@ -153,6 +153,7 @@ class FastKMeans:
 
         copy_stream = torch.cuda.Stream(device)
         compute_stream = torch.cuda.Stream(device)
+        copy_event = torch.cuda.Event()
 
         centroid_norms = torch.empty((self.k,), device=device, dtype=self.dtype)
         best_dist, best_ids = None, None
@@ -168,20 +169,20 @@ class FastKMeans:
             with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
                 for batch in dataloader:
                     with torch.cuda.stream(copy_stream):
-                        if isinstance(batch, tuple):
-                            data_chunk = batch[-1]
-                        else:
-                            data_chunk = batch
-                            
+                        data_chunk = batch[-1] if isinstance(batch, tuple) else batch
                         data_chunk = data_chunk.to(device, dtype=self.dtype, non_blocking=True)
                         data_chunk_norms = (data_chunk ** 2).sum(dim=1)
-                    copy_stream.synchronize()
+                    copy_stream.record_event(copy_event)
 
                     batch_size = data_chunk.size(0)
+                    if best_dist is None or len(best_dist) != batch_size:
+                        best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=torch.float32)
+                    else:
+                        best_dist.fill_(float("inf"))
+                    if best_ids is None or len(best_ids) != batch_size:
+                        best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
 
-                    best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=torch.float32)
-                    best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
-
+                    compute_stream.wait_event(copy_event)
                     with torch.cuda.stream(compute_stream):
                         if self.use_triton:
                             triton_kmeans(
@@ -280,24 +281,27 @@ class FastKMeans:
 
         copy_stream = torch.cuda.Stream(device)
         compute_stream = torch.cuda.Stream(device)
+        copy_event = torch.cuda.Event()
+
+        best_dist, best_ids = None, None
 
         with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
             for batch in dataloader:
                 with torch.cuda.stream(copy_stream):
-                    if isinstance(batch, tuple):
-                        data_chunk = batch[-1]
-                    else:
-                        data_chunk = batch
-
+                    data_chunk = batch[-1] if isinstance(batch, tuple) else batch
                     data_chunk = data_chunk.to(device=device, dtype=self.dtype, non_blocking=True)
                     data_chunk_norms = (data_chunk**2).sum(dim=1)
-                copy_stream.synchronize()
+                copy_stream.record_event(copy_event)
 
                 batch_size = data_chunk.size(0)
+                if best_dist is None or len(best_dist) != batch_size:
+                    best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=torch.float32)
+                else:
+                    best_dist.fill_(float("inf"))
+                if best_ids is None or len(best_ids) != batch_size:
+                    best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
 
-                best_dist = torch.full((batch_size,), float("inf"), device=device, dtype=torch.float32)
-                best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
-
+                compute_stream.wait_event(copy_event)
                 with torch.cuda.stream(compute_stream):
                     if self.use_triton:
                         triton_kmeans(
