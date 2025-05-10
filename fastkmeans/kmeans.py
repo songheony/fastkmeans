@@ -173,7 +173,7 @@ class FastKMeans:
                         else:
                             data_chunk = batch
                             
-                        data_chunk = data.to(device, dtype=self.dtype, non_blocking=True)
+                        data_chunk = data_chunk.to(device, dtype=self.dtype, non_blocking=True)
                         data_chunk_norms = (data_chunk ** 2).sum(dim=1)
                     copy_stream.synchronize()
 
