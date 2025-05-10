@@ -107,11 +107,11 @@ def triton_kmeans(
     data_chunk_norms: torch.Tensor,
     centroids: torch.Tensor,
     centroids_sqnorm: torch.Tensor,
+    best_dist: torch.Tensor,
     best_ids: torch.Tensor,
 ):
     B, D = data_chunk.shape
     C = centroids.shape[0]
-    best_dist = torch.full((B,), 1e38, device=data_chunk.device, dtype=torch.float32)
 
     def grid(meta):
         return (triton.cdiv(B, meta["BLOCK_M"]) * triton.cdiv(C, meta["BLOCK_N"]),)  # 1D grid
