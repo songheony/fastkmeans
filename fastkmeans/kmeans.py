@@ -116,7 +116,6 @@ class FastKMeans:
         self.verbose = verbose
 
         if seed is not None:
-            random.seed(seed)
             torch.manual_seed(seed)
 
         if use_triton and not HAS_TRITON:
