@@ -15,9 +15,9 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _get_random_features(dataloader: DataLoader, n_samples: int) -> torch.Tensor:
+def _get_random_data(dataloader: DataLoader, n_samples: int) -> torch.Tensor:
     """
-    Returns a random sample of features from the dataloader.
+    Returns a random sample of data from the dataloader.
 
     Parameters
     ----------
@@ -29,12 +29,13 @@ def _get_random_features(dataloader: DataLoader, n_samples: int) -> torch.Tensor
     Returns
     -------
     torch.Tensor
-        Randomly sampled features.
+        Randomly sampled data.
     """
     chunks, total = [], 0
-    for _, _, features in dataloader:
-        chunks.append(features)
-        total += features.shape[0]
+    for batch in dataloader:
+        data = batch[-1] if isinstance(batch, tuple) else batch
+        chunks.append(data)
+        total += data.shape[0]
         if total >= n_samples * 10:
             break
     chunks = torch.cat(chunks, dim=0)
@@ -142,7 +143,7 @@ class FastKMeans:
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         if rank == 0:
-            init = _get_random_features(dataloader, self.k).to(device=device, dtype=self.dtype)
+            init = _get_random_data(dataloader, self.k).to(device=device, dtype=self.dtype)
             centroids = init.contiguous()
         else:
             centroids = torch.empty((self.k, self.d), device=device, dtype=self.dtype)
@@ -220,7 +221,7 @@ class FastKMeans:
 
                 empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
                 if len(empty_ids) > 0:
-                    random_data = _get_random_features(dataloader, len(empty_ids)).to(device=device, dtype=self.dtype)
+                    random_data = _get_random_data(dataloader, len(empty_ids)).to(device=device, dtype=self.dtype)
                     new_centroids[empty_ids] = random_data
 
                 shift = torch.norm(new_centroids - prev_centroids, dim=1).sum()
