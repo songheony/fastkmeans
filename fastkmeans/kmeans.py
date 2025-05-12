@@ -15,7 +15,7 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _get_random_data(dataloader: DataLoader, n_samples: int) -> torch.Tensor:
+def _get_random_data(dataloader: DataLoader, n_samples: int, rank: int) -> torch.Tensor:
     """
     Returns a random sample of data from the dataloader.
 
@@ -33,20 +33,20 @@ def _get_random_data(dataloader: DataLoader, n_samples: int) -> torch.Tensor:
     """
     chunks, total = [], 0
     for batch in dataloader:
-        data = batch[-1] if isinstance(batch, tuple) else batch
+        data = batch[-1] if isinstance(batch, (list, tuple)) else batch
         chunks.append(data)
         total += data.shape[0]
-        if total >= n_samples * 10:
+        if total >= n_samples:
             break
-    chunks = torch.cat(chunks, dim=0)
-    return chunks[torch.randperm(chunks.shape[0])[:n_samples]]
+    chunks = torch.cat(chunks, dim=0)[:n_samples]
+    return chunks
 
 
 def _assign_lloyd(
     data_chunk: torch.Tensor,
     data_chunk_norms: torch.Tensor,
     centroids: torch.Tensor,
-    centroids_norms: torch.Tensor,
+    centroid_norms: torch.Tensor,
     best_dist: torch.Tensor,
     best_ids: torch.Tensor,
     chunk_size_centroids: int,
@@ -62,7 +62,7 @@ def _assign_lloyd(
 
         local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
         improved_mask = local_min_vals < best_dist
-        best_dist[improved_mask] = local_min_vals[improved_mask]
+        best_dist[improved_mask] = local_min_vals[improved_mask].float()
         best_ids[improved_mask] = c_start + local_min_ids[improved_mask]
 
         c_start = c_end
@@ -123,9 +123,7 @@ class FastKMeans:
             raise ValueError("Triton is not available. Please install Triton and try again.")
         self.use_triton = use_triton
 
-        self.centroids = None
-
-    @torch.inference_mode()
+    @torch.no_grad()
     def fit(self, dataloader: DataLoader, device: torch.device):
         """
         Fits the KMeans model to the data.
@@ -137,24 +135,20 @@ class FastKMeans:
         device : torch.device
             Device to use for computation.
         """
-        torch.backends.cuda.matmul.allow_tf32 = True
-
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        if rank == 0:
-            init = _get_random_data(dataloader, self.k).to(device=device, dtype=self.dtype)
-            centroids = init.contiguous()
-        else:
-            centroids = torch.empty((self.k, self.d), device=device, dtype=self.dtype)
-        prev_centroids = centroids.clone()
-
+        random_data = _get_random_data(dataloader, self.k, rank).to(device=device, dtype=self.dtype)
+        
         if dist.is_initialized():
-            dist.broadcast(centroids, src=0)
+            gathered_data = [torch.empty_like(random_data) for _ in range(world_size)]
+            dist.all_gather(gathered_data, random_data)
 
-        copy_stream = torch.cuda.Stream(device)
-        compute_stream = torch.cuda.Stream(device)
-        copy_event = torch.cuda.Event()
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self.seed or 0)
+            candidates = torch.cat(gathered_data, dim=0)
+            perm = torch.randperm(candidates.size(0), device=device, generator=gen)
+            centroids = candidates[perm[:self.k]].contiguous()
 
         centroid_norms = torch.empty((self.k,), device=device, dtype=self.dtype)
         best_dist, best_ids = None, None
@@ -164,16 +158,13 @@ class FastKMeans:
 
             centroid_norms.copy_((centroids ** 2).sum(dim=1))
 
-            cluster_sums = torch.zeros((self.k, self.d), device=device, dtype=torch.float32)
-            cluster_counts = torch.zeros((self.k,), device=device, dtype=torch.float32)
+            cluster_fused_data = torch.zeros((self.k, self.d + 1), device=device, dtype=torch.float32)
 
-            with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
+            with tqdm(desc=f"Fitting ({iteration + 1}th iteration)", disable=rank != 0, total=len(dataloader)) as pbar:
                 for batch in dataloader:
-                    with torch.cuda.stream(copy_stream):
-                        data_chunk = batch[-1] if isinstance(batch, tuple) else batch
-                        data_chunk = data_chunk.to(device, dtype=self.dtype, non_blocking=True)
-                        data_chunk_norms = (data_chunk ** 2).sum(dim=1)
-                    copy_stream.record_event(copy_event)
+                    data_chunk = batch[-1] if isinstance(batch, (list, tuple)) else batch
+                    data_chunk = data_chunk.to(device, dtype=self.dtype, non_blocking=True)
+                    data_chunk_norms = (data_chunk ** 2).sum(dim=1)
 
                     batch_size = data_chunk.size(0)
                     if best_dist is None or len(best_dist) != batch_size:
@@ -181,60 +172,75 @@ class FastKMeans:
                     else:
                         best_dist.fill_(float("inf"))
                     if best_ids is None or len(best_ids) != batch_size:
-                        best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
+                        best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+                    else:
+                        best_ids.fill_(0)
 
-                    compute_stream.wait_event(copy_event)
-                    with torch.cuda.stream(compute_stream):
-                        if self.use_triton:
-                            triton_kmeans(
-                                data_chunk=data_chunk,
-                                data_chunk_norms=data_chunk_norms,
-                                centroids=centroids,
-                                centroids_sqnorm=centroid_norms,
-                                best_dist=best_dist,
-                                best_ids=best_ids,
-                            )
-                        else:
-                            _assign_lloyd(
-                                data_chunk=data_chunk,
-                                data_chunk_norms=data_chunk_norms,
-                                centroids=centroids,
-                                centroids_norms=centroid_norms,
-                                best_dist=best_dist,
-                                best_ids=best_ids,
-                                chunk_size_centroids=self.chunk_size_centroids,
-                            )
+                    if self.use_triton:
+                        triton_kmeans(
+                            data_chunk=data_chunk,
+                            data_chunk_norms=data_chunk_norms,
+                            centroids=centroids,
+                            centroids_sqnorm=centroid_norms,
+                            best_dist=best_dist,
+                            best_ids=best_ids,
+                        )
+                    else:
+                        _assign_lloyd(
+                            data_chunk=data_chunk,
+                            data_chunk_norms=data_chunk_norms,
+                            centroids=centroids,
+                            centroid_norms=centroid_norms,
+                            best_dist=best_dist,
+                            best_ids=best_ids,
+                            chunk_size_centroids=self.chunk_size_centroids,
+                        )
 
-                        cluster_sums.index_add_(0, best_ids, data_chunk.float())
-                        cluster_counts.index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
+                    cluster_fused_data[:, :-1].index_add_(0, best_ids, data_chunk.float())
+                    cluster_fused_data[:, -1].index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
 
                     pbar.update(1)
 
             if dist.is_initialized():
-                dist.all_reduce(cluster_sums, op=dist.ReduceOp.SUM, async_op=True)
-                dist.all_reduce(cluster_counts, op=dist.ReduceOp.SUM, async_op=True)
+                base = self.k // world_size
+                extras = self.k % world_size
+                sizes = [base + (1 if r < extras else 0) for r in range(world_size)]
 
-            if rank == 0:
-                new_centroids = torch.zeros_like(centroids)
-                non_empty = cluster_counts > 0
-                new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=self.dtype)
+                chunks = list(cluster_fused_data.split(sizes, dim=0))
+                local_chunk = torch.zeros_like(chunks[rank])
+                dist.reduce_scatter(local_chunk, chunks, op=dist.ReduceOp.SUM)
 
-                empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
+                local_sums = local_chunk[:, :-1]
+                local_counts = local_chunk[:, -1]
+                local_new_centroids = torch.zeros_like(local_sums, dtype=self.dtype)
+                mask = local_counts > 0
+                local_new_centroids[mask] = (local_sums[mask] / local_counts[mask].unsqueeze(1)).to(self.dtype)
+
+                empty_ids = (~mask).nonzero(as_tuple=True)[0]
                 if len(empty_ids) > 0:
-                    random_data = _get_random_data(dataloader, len(empty_ids)).to(device=device, dtype=self.dtype)
-                    new_centroids[empty_ids] = random_data
+                    random_data = _get_random_data(dataloader, len(empty_ids), rank).to(device=device, dtype=self.dtype)
+                    local_new_centroids[empty_ids] = random_data
 
-                shift = torch.norm(new_centroids - prev_centroids, dim=1).sum()
+                gathered = [torch.zeros_like(local_new_centroids) for _ in range(world_size)]
+                dist.all_gather(gathered, local_new_centroids)
+                new_centroids = torch.cat(gathered, dim=0)
+
+                shift = torch.norm(new_centroids - centroids, dim=1).sum().item()
                 centroids.copy_(new_centroids)
-                prev_centroids = centroids.clone()
             else:
-                shift = torch.zeros((1,), device=device, dtype=self.dtype)
+                local_sums = cluster_fused_data[:, :-1]
+                local_counts = cluster_fused_data[:, -1]
+                local_new_centroids = torch.zeros_like(local_sums, dtype=self.dtype)
+                mask = local_counts > 0
+                local_new_centroids[mask] = (local_sums[mask] / local_counts[mask].unsqueeze(1)).to(self.dtype)
 
-            if dist.is_initialized():
-                dist.broadcast(centroids, src=0)
-                dist.broadcast(shift, src=0)
+                empty_ids = (~mask).nonzero(as_tuple=True)[0]
+                if len(empty_ids) > 0:
+                    random_data = _get_random_data(dataloader, len(empty_ids), rank).to(device=device, dtype=self.dtype)
+                    local_new_centroids[empty_ids] = random_data
 
-            shift = shift.item()
+                shift = torch.norm(local_new_centroids - centroids, dim=1).sum().item()
+                centroids.copy_(local_new_centroids)
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
@@ -248,15 +254,17 @@ class FastKMeans:
                 break
 
         if rank == 0:
-            self.centroids = centroids.cpu().contiguous().numpy()
+            return centroids.cpu().contiguous().numpy()
 
-    @torch.inference_mode()
-    def predict(self, dataloader: DataLoader, device: torch.device) -> tuple[np.ndarray, list]:
+    @torch.no_grad()
+    def predict(self, centroids: np.ndarray, dataloader: DataLoader, device: torch.device) -> tuple[np.ndarray, list]:
         """
         Predicts the cluster labels for the data in the dataloader.
 
         Parameters
         ----------
+        centroids : np.ndarray
+            Centroids to use for prediction.
         dataloader : DataLoader
             Dataloader to predict the labels for.
         device : torch.device
@@ -267,10 +275,7 @@ class FastKMeans:
         tuple[np.ndarray, list]
             Tuple containing the predicted labels and a list of mappings.
         """
-        if self.centroids is None:
-            raise RuntimeError("Must call train() or fit() before predict().")
-
-        centroids_torch = torch.as_tensor(self.centroids, device=device, dtype=self.dtype)
+        centroids_torch = torch.as_tensor(centroids, device=device, dtype=self.dtype)
         centroid_norms = (centroids_torch**2).sum(dim=1)
 
         mappings = []
@@ -280,19 +285,13 @@ class FastKMeans:
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        copy_stream = torch.cuda.Stream(device)
-        compute_stream = torch.cuda.Stream(device)
-        copy_event = torch.cuda.Event()
-
         best_dist, best_ids = None, None
 
-        with tqdm(desc="Processing batches", disable=rank != 0) as pbar:
+        with tqdm(desc="Prediction", disable=rank != 0, total=len(dataloader)) as pbar:
             for batch in dataloader:
-                with torch.cuda.stream(copy_stream):
-                    data_chunk = batch[-1] if isinstance(batch, tuple) else batch
-                    data_chunk = data_chunk.to(device=device, dtype=self.dtype, non_blocking=True)
-                    data_chunk_norms = (data_chunk**2).sum(dim=1)
-                copy_stream.record_event(copy_event)
+                data_chunk = batch[-1] if isinstance(batch, (list, tuple)) else batch
+                data_chunk = data_chunk.to(device=device, dtype=self.dtype, non_blocking=True)
+                data_chunk_norms = (data_chunk**2).sum(dim=1)
 
                 batch_size = data_chunk.size(0)
                 if best_dist is None or len(best_dist) != batch_size:
@@ -300,52 +299,67 @@ class FastKMeans:
                 else:
                     best_dist.fill_(float("inf"))
                 if best_ids is None or len(best_ids) != batch_size:
-                    best_ids = torch.empty((batch_size,), device=device, dtype=torch.long)
+                    best_ids = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
-                compute_stream.wait_event(copy_event)
-                with torch.cuda.stream(compute_stream):
-                    if self.use_triton:
-                        triton_kmeans(
-                            data_chunk,
-                            data_chunk_norms,
-                            centroids_torch,
-                            centroid_norms,
-                            best_ids,
-                        )
-                    else:
-                        _assign_lloyd(
-                            data_chunk,
-                            data_chunk_norms,
-                            centroids_torch,
-                            centroid_norms,
-                            best_dist,
-                            best_ids,
-                            chunk_size_centroids=self.chunk_size_centroids,
-                        )
-                    
+                if self.use_triton:
+                    triton_kmeans(
+                        data_chunk,
+                        data_chunk_norms,
+                        centroids_torch,
+                        centroid_norms,
+                        best_ids,
+                    )
+                else:
+                    _assign_lloyd(
+                        data_chunk,
+                        data_chunk_norms,
+                        centroids_torch,
+                        centroid_norms,
+                        best_dist,
+                        best_ids,
+                        chunk_size_centroids=self.chunk_size_centroids,
+                    )
+
                 distances.append(best_dist.cpu())
                 labels.append(best_ids.cpu())
 
-                if isinstance(batch, tuple):
+                if isinstance(batch, (list, tuple)):
                     for mapping in zip(*batch[:-1]):
                         mappings.append(mapping)
 
                 pbar.update(1)
 
-        labels = torch.cat(labels, dim=0).numpy()
-        distances = torch.cat(distances, dim=0).numpy()
+        labels = torch.cat(labels, dim=0)
+        distances = torch.cat(distances, dim=0)
 
         if dist.is_initialized():
-            pack = {"labels": labels, "distances": distances, "mappings": mappings}
-            gathered = [None] * world_size
-            dist.all_gather_object(gathered, pack)
+            torch.cuda.synchronize()
+            dist.barrier(device_ids=[rank])
 
+            gloo_group = dist.new_group(
+                ranks=list(range(world_size)),
+                backend="gloo"
+            )
+
+            pack = {"labels": labels, "distances": distances, "mappings": mappings}
             if rank == 0:
+                gathered = [None] * world_size
+                dist.gather_object(
+                    obj=pack,
+                    object_gather_list=gathered,
+                    dst=0,
+                    group=gloo_group
+                )
                 labels = np.concatenate([g["labels"] for g in gathered], axis=0)
                 distances = np.concatenate([g["distances"] for g in gathered], axis=0)
                 mappings = sum([g["mappings"] for g in gathered], [])
                 return labels, distances, mappings
             else:
-                return None, None, None
-        else:
-            return labels, distances, mappings
+                dist.gather_object(obj=pack, dst=0, group=gloo_group)
+                labels = None
+                distances = None
+                mappings = None
+
+            dist.destroy_process_group(gloo_group)
+
+        return labels, distances, mappings
