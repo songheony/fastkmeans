@@ -149,6 +149,8 @@ class FastKMeans:
             candidates = torch.cat(gathered_data, dim=0)
             perm = torch.randperm(candidates.size(0), device=device, generator=gen)
             centroids = candidates[perm[:self.k]].contiguous()
+            del candidates, gathered_data, random_data
+            torch.cuda.empty_cache()
 
         centroid_norms = torch.empty((self.k,), device=device, dtype=self.dtype)
         best_dist, best_ids = None, None
@@ -199,6 +201,9 @@ class FastKMeans:
                     cluster_fused_data[:, :-1].index_add_(0, best_ids, data_chunk.float())
                     cluster_fused_data[:, -1].index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
 
+                    del batch, data_chunk, data_chunk_norms
+                    torch.cuda.empty_cache()
+
                     pbar.update(1)
 
             if dist.is_initialized():
@@ -227,6 +232,9 @@ class FastKMeans:
 
                 shift = torch.norm(new_centroids - centroids, dim=1).sum().item()
                 centroids.copy_(new_centroids)
+                
+                del gathered, local_new_centroids, local_sums, local_counts, chunks, local_chunk
+                torch.cuda.empty_cache()
             else:
                 local_sums = cluster_fused_data[:, :-1]
                 local_counts = cluster_fused_data[:, -1]
@@ -241,6 +249,9 @@ class FastKMeans:
 
                 shift = torch.norm(local_new_centroids - centroids, dim=1).sum().item()
                 centroids.copy_(local_new_centroids)
+                
+                del local_new_centroids, local_sums, local_counts
+                torch.cuda.empty_cache()
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
@@ -328,6 +339,9 @@ class FastKMeans:
                         mappings.append(mapping)
 
                 pbar.update(1)
+
+                del batch, data_chunk, data_chunk_norms
+                torch.cuda.empty_cache()
 
         labels = torch.cat(labels, dim=0)
         distances = torch.cat(distances, dim=0)
