@@ -335,9 +335,11 @@ class FastKMeans:
         distances = torch.cat(distances, dim=0)
 
         if dist.is_initialized():
+            gloo_group = dist.new_group(backend="gloo", ranks=list(range(world_size)))
+
             length = torch.tensor([labels.numel()], dtype=torch.int64)
             all_lengths = [torch.empty_like(length) for _ in range(world_size)]
-            dist.all_gather(all_lengths, length)
+            dist.all_gather(all_lengths, length, group=gloo_group)
 
             max_length = max([l.item() for l in all_lengths])
 
@@ -349,20 +351,22 @@ class FastKMeans:
             if rank == 0:
                 gathered_labels = [torch.empty_like(labels) for _ in range(world_size)]
                 gathered_distances = [torch.empty_like(distances) for _ in range(world_size)]
-                dist.gather(gathered_labels, labels, dst=0)
-                dist.gather(gathered_distances, distances, dst=0)
-                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
-                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
+                dist.gather(labels, gathered_labels, dst=0, group=gloo_group)
+                dist.gather(distances, gathered_distances, dst=0, group=gloo_group)
+                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
+                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
 
                 gathered_mappings = [None] * world_size
-                dist.gather_object(mappings, gathered_mappings, dst=0)
+                dist.gather_object(mappings, gathered_mappings, dst=0, group=gloo_group)
                 mappings = sum(gathered_mappings, [])
             else:
-                dist.gather(labels, dst=0)
-                dist.gather(distances, dst=0)
-                dist.gather_object(mappings, dst=0)
+                dist.gather(labels, dst=0, group=gloo_group)
+                dist.gather(distances, dst=0, group=gloo_group)
+                dist.gather_object(mappings, dst=0, group=gloo_group)
                 labels = None
                 distances = None
                 mappings = None
+
+            dist.destroy_process_group(gloo_group)
 
         return labels, distances, mappings
