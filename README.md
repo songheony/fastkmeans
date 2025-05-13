@@ -89,9 +89,9 @@ CUDA_VISIBLE_DEVICES=0 python speedbench.py --do-faiss --do-fastkmeans --do-fast
 If you use fastmeans and want to/need to cite it in your work, please feel free to use the citation below:
 
 ```bibtex
-@misc{fastkmeans2024,
+@misc{fastkmeans2025,
   author = {Benjamin Clavié and Benjamin Warner},
   title = {fastkmeans: Accelerated KMeans Clustering in PyTorch and Triton},
-  year = {2024},
+  year = {2025},
   howpublished = {\url{https://github.com/AnswerDotAI/fastkmeans/}}
 }
