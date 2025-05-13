@@ -149,8 +149,6 @@ class FastKMeans:
             candidates = torch.cat(gathered_data, dim=0)
             perm = torch.randperm(candidates.size(0), device=device, generator=gen)
             centroids = candidates[perm[:self.k]].contiguous()
-            del candidates, gathered_data, random_data
-            torch.cuda.empty_cache()
 
         centroid_norms = torch.empty((self.k,), device=device, dtype=self.dtype)
         best_dist, best_ids = None, None
@@ -201,15 +199,13 @@ class FastKMeans:
                     cluster_fused_data[:, :-1].index_add_(0, best_ids, data_chunk.float())
                     cluster_fused_data[:, -1].index_add_(0, best_ids, torch.ones_like(best_ids, dtype=torch.float32))
 
-                    del batch, data_chunk, data_chunk_norms
-                    torch.cuda.empty_cache()
-
                     pbar.update(1)
 
             if dist.is_initialized():
                 base = self.k // world_size
                 extras = self.k % world_size
                 sizes = [base + (1 if r < extras else 0) for r in range(world_size)]
+                max_size = max(sizes)
 
                 chunks = list(cluster_fused_data.split(sizes, dim=0))
                 local_chunk = torch.zeros_like(chunks[rank])
@@ -226,15 +222,13 @@ class FastKMeans:
                     random_data = _get_random_data(dataloader, len(empty_ids), rank).to(device=device, dtype=self.dtype)
                     local_new_centroids[empty_ids] = random_data
 
-                gathered = [torch.zeros_like(local_new_centroids) for _ in range(world_size)]
+                gathered = [torch.empty(max_size, self.d, device=device, dtype=self.dtype) for _ in range(world_size)]
                 dist.all_gather(gathered, local_new_centroids)
+                gathered = [g[:s] for g, s in zip(gathered, sizes)]
                 new_centroids = torch.cat(gathered, dim=0)
 
                 shift = torch.norm(new_centroids - centroids, dim=1).sum().item()
                 centroids.copy_(new_centroids)
-                
-                del gathered, local_new_centroids, local_sums, local_counts, chunks, local_chunk
-                torch.cuda.empty_cache()
             else:
                 local_sums = cluster_fused_data[:, :-1]
                 local_counts = cluster_fused_data[:, -1]
@@ -249,9 +243,6 @@ class FastKMeans:
 
                 shift = torch.norm(local_new_centroids - centroids, dim=1).sum().item()
                 centroids.copy_(local_new_centroids)
-                
-                del local_new_centroids, local_sums, local_counts
-                torch.cuda.empty_cache()
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
@@ -340,40 +331,38 @@ class FastKMeans:
 
                 pbar.update(1)
 
-                del batch, data_chunk, data_chunk_norms
-                torch.cuda.empty_cache()
-
         labels = torch.cat(labels, dim=0)
         distances = torch.cat(distances, dim=0)
 
         if dist.is_initialized():
-            torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            length = torch.tensor([labels.numel()], dtype=torch.int64)
+            all_lengths = [torch.empty_like(length) for _ in range(world_size)]
+            dist.all_gather(all_lengths, length)
 
-            gloo_group = dist.new_group(
-                ranks=list(range(world_size)),
-                backend="gloo"
-            )
+            max_length = max([l.item() for l in all_lengths])
 
-            pack = {"labels": labels, "distances": distances, "mappings": mappings}
+            if max_length > length.item():
+                pad = max_length - labels.size(0)
+                labels = torch.cat([labels, torch.empty(pad, dtype=torch.long)])
+                distances = torch.cat([distances, torch.empty(pad, dtype=torch.float32)])
+
             if rank == 0:
-                gathered = [None] * world_size
-                dist.gather_object(
-                    obj=pack,
-                    object_gather_list=gathered,
-                    dst=0,
-                    group=gloo_group
-                )
-                labels = np.concatenate([g["labels"] for g in gathered], axis=0)
-                distances = np.concatenate([g["distances"] for g in gathered], axis=0)
-                mappings = sum([g["mappings"] for g in gathered], [])
-                return labels, distances, mappings
+                gathered_labels = [torch.empty_like(labels) for _ in range(world_size)]
+                gathered_distances = [torch.empty_like(distances) for _ in range(world_size)]
+                dist.gather(gathered_labels, labels, dst=0)
+                dist.gather(gathered_distances, distances, dst=0)
+                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
+                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
+
+                gathered_mappings = [None] * world_size
+                dist.gather_object(mappings, gathered_mappings, dst=0)
+                mappings = sum(gathered_mappings, [])
             else:
-                dist.gather_object(obj=pack, dst=0, group=gloo_group)
+                dist.gather(labels, dst=0)
+                dist.gather(distances, dst=0)
+                dist.gather_object(mappings, dst=0)
                 labels = None
                 distances = None
                 mappings = None
-
-            dist.destroy_process_group(gloo_group)
 
         return labels, distances, mappings

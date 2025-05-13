@@ -4,10 +4,6 @@ import socket
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
-from fastkmeans import FastKMeans
-
-
-mp.set_start_method("spawn", force=True)
 
 
 def _setup_master_env():
@@ -68,14 +64,15 @@ def distributed_fit(build_datasets,
                     build_kmeans,
                     num_gpus,
                     dataloader_kwargs):
-    manager = mp.Manager()
+    ctx = mp.get_context("spawn")
+    manager = ctx.Manager()
     queue = manager.Queue()
 
     _setup_master_env()
 
     procs = []
     for rank, build_dataset in enumerate(build_datasets):
-        p = mp.Process(
+        p = ctx.Process(
             target=_worker,
             args=(rank, num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue, "fit"),
         )
@@ -97,14 +94,15 @@ def distributed_predict(build_datasets,
                         centroids,
                         num_gpus,
                         dataloader_kwargs):
-    manager = mp.Manager()
+    ctx = mp.get_context("spawn")
+    manager = ctx.Manager()
     queue = manager.Queue()
 
     _setup_master_env()
     
     procs = []
     for rank, build_dataset in enumerate(build_datasets):
-        p = mp.Process(
+        p = ctx.Process(
             target=_worker,
             args=(rank, num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue, "predict", centroids),
         )
