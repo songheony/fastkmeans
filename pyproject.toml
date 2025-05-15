@@ -3,7 +3,7 @@ name = "fastkmeans"
 version = "0.5.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = ["torch", "numpy"]
 authors = [
   {name = "Ben Clavié", email = "bc@answer.ai" },

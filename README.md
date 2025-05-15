@@ -95,3 +95,4 @@ If you use fastmeans and want to/need to cite it in your work, please feel free 
   year = {2025},
   howpublished = {\url{https://github.com/AnswerDotAI/fastkmeans/}}
 }
+```
