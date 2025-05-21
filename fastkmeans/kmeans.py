@@ -256,7 +256,7 @@ class FastKMeans:
                 break
 
         if rank == 0:
-            return centroids.cpu().contiguous().numpy()
+            return centroids.cpu().contiguous()
 
     @torch.no_grad()
     def predict(self, centroids: np.ndarray, dataloader: DataLoader, device: torch.device) -> tuple[np.ndarray, list]:
