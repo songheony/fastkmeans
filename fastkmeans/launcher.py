@@ -15,15 +15,6 @@ def _setup_master_env():
         os.environ["MASTER_PORT"] = str(s.getsockname()[1])
         s.close()
 
-
-def _make_loader(ds, rank, world_size, dl_kwargs):
-    if isinstance(ds, IterableDataset):
-        return DataLoader(ds, **dl_kwargs)
-    else:
-        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
-        return DataLoader(ds, sampler=sampler, **dl_kwargs)
-
-
 def _worker(
     rank: int,
     world_size: int,
@@ -43,7 +34,7 @@ def _worker(
         device = torch.device(f"cuda:{rank}")
 
         ds = build_dataset()
-        dl = _make_loader(ds, rank, world_size, dataloader_kwargs)
+        dl = DataLoader(ds, **dataloader_kwargs)
 
         km = build_kmeans()
 

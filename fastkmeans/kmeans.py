@@ -15,21 +15,23 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _get_random_data(dataloader: DataLoader, n_samples: int, rank: int) -> torch.Tensor:
+def _get_random_data(dataloader: DataLoader, n_samples: int, rng: torch.Generator) -> torch.Tensor:
     """
-    Returns a random sample of data from the dataloader.
+    Returns a random sample of data from the dataloader on the current rank.
 
     Parameters
     ----------
     dataloader : DataLoader
-        Dataloader to sample from.
+        Dataloader to sample from (expected to be for the current rank).
     n_samples : int
-        Number of samples to return.
+        Desired number of samples.
+    rng : torch.Generator
+        PyTorch random number generator.
 
     Returns
     -------
     torch.Tensor
-        Randomly sampled data.
+        Randomly sampled data from this rank.
     """
     chunks, total = [], 0
     for batch in dataloader:
@@ -38,7 +40,9 @@ def _get_random_data(dataloader: DataLoader, n_samples: int, rank: int) -> torch
         total += data.shape[0]
         if total >= n_samples:
             break
-    chunks = torch.cat(chunks, dim=0)[:n_samples]
+    chunks = torch.cat(chunks, dim=0)
+    random_indices = torch.randperm(chunks.shape[0], generator=rng)[:n_samples]
+    chunks = chunks[random_indices]
     return chunks
 
 
@@ -116,8 +120,8 @@ class FastKMeans:
         self.dtype = dtype
         self.verbose = verbose
 
-        if seed is not None:
-            torch.manual_seed(seed)
+        self.rng = torch.Generator()
+        self.rng.manual_seed(self.seed)
 
         if use_triton and not HAS_TRITON:
             raise ValueError("Triton is not available. Please install Triton and try again.")
@@ -138,17 +142,40 @@ class FastKMeans:
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        random_data = _get_random_data(dataloader, self.k, rank).to(device=device, dtype=self.dtype)
-        
-        if dist.is_initialized():
-            gathered_data = [torch.empty_like(random_data) for _ in range(world_size)]
-            dist.all_gather(gathered_data, random_data)
+        random_data = _get_random_data(dataloader, self.k, self.rng).to(device=device, dtype=self.dtype)
 
-            gen = torch.Generator(device=device)
-            gen.manual_seed(self.seed or 0)
-            candidates = torch.cat(gathered_data, dim=0)
-            perm = torch.randperm(candidates.size(0), device=device, generator=gen)
-            centroids = candidates[perm[:self.k]].contiguous()
+        if dist.is_initialized():
+            actual_length = random_data.size(0)
+            if actual_length < self.k:
+                padding = self.k - actual_length
+                random_data = torch.cat([random_data, torch.empty(padding, self.d, device=device, dtype=self.dtype)])
+
+            length = torch.tensor([actual_length], device=device, dtype=torch.int64)
+
+            if rank == 0:
+                gathered_data = [torch.empty_like(random_data) for _ in range(world_size)]
+                all_lengths = [torch.empty_like(length) for _ in range(world_size)]
+                dist.gather(random_data, gathered_data, dst=0)
+                dist.gather(length, all_lengths, dst=0)
+            else:
+                dist.gather(random_data, dst=0)
+                dist.gather(length, dst=0)
+
+            dist.barrier()
+
+            if rank == 0:
+                candidates = torch.cat([gathered_data[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
+                random_indices = torch.randperm(candidates.size(0), generator=self.rng)[:self.k].to(device)
+                centroids = candidates[random_indices].contiguous()
+            else:
+                centroids = torch.empty(self.k, self.d, device=device, dtype=self.dtype)
+
+            dist.broadcast(centroids, src=0)
+        else:
+            centroids = random_data[:self.k].to(device)
+
+        variances = torch.var(centroids, dim=0)
+        _tol = torch.mean(variances) * self.tol
 
         centroid_norms = torch.empty((self.k,), device=device, dtype=self.dtype)
         best_dist, best_ids = None, None
@@ -219,7 +246,7 @@ class FastKMeans:
 
                 empty_ids = (~mask).nonzero(as_tuple=True)[0]
                 if len(empty_ids) > 0:
-                    random_data = _get_random_data(dataloader, len(empty_ids), rank).to(device=device, dtype=self.dtype)
+                    random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
                     local_new_centroids[empty_ids] = random_data
 
                 gathered = [torch.empty(max_size, self.d, device=device, dtype=self.dtype) for _ in range(world_size)]
@@ -238,7 +265,7 @@ class FastKMeans:
 
                 empty_ids = (~mask).nonzero(as_tuple=True)[0]
                 if len(empty_ids) > 0:
-                    random_data = _get_random_data(dataloader, len(empty_ids), rank).to(device=device, dtype=self.dtype)
+                    random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
                     local_new_centroids[empty_ids] = random_data
 
                 shift = torch.norm(local_new_centroids - centroids, dim=1).sum().item()
@@ -250,9 +277,9 @@ class FastKMeans:
                     f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}"
                 )
 
-            if shift < self.tol:
+            if shift < _tol:
                 if self.verbose and rank == 0:
-                    print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {self.tol})")
+                    print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {_tol})")
                 break
 
         if rank == 0:
@@ -351,22 +378,25 @@ class FastKMeans:
             if rank == 0:
                 gathered_labels = [torch.empty_like(labels) for _ in range(world_size)]
                 gathered_distances = [torch.empty_like(distances) for _ in range(world_size)]
+                gathered_mappings = [None] * world_size
                 dist.gather(labels, gathered_labels, dst=0, group=gloo_group)
                 dist.gather(distances, gathered_distances, dst=0, group=gloo_group)
-                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
-                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
-
-                gathered_mappings = [None] * world_size
                 dist.gather_object(mappings, gathered_mappings, dst=0, group=gloo_group)
-                mappings = sum(gathered_mappings, [])
             else:
                 dist.gather(labels, dst=0, group=gloo_group)
                 dist.gather(distances, dst=0, group=gloo_group)
                 dist.gather_object(mappings, dst=0, group=gloo_group)
-                labels = None
-                distances = None
-                mappings = None
+
+            dist.barrier(group=gloo_group)
+
+            if rank == 0:
+                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
+                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
+                mappings = sum(gathered_mappings, [])
 
             dist.destroy_process_group(gloo_group)
 
-        return labels, distances, mappings
+        if rank == 0:
+            return labels, distances, mappings
+        else:
+            return None, None, None
