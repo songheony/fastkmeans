@@ -2,7 +2,6 @@ import os
 import socket
 
 import torch
-import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 
 
@@ -14,6 +13,7 @@ def _setup_master_env():
         s.bind(("", 0))
         os.environ["MASTER_PORT"] = str(s.getsockname()[1])
         s.close()
+
 
 def _worker(
     rank: int,
