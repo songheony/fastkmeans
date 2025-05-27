@@ -3,7 +3,7 @@ import socket
 
 import torch
 import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
+from torch.utils.data import DataLoader
 
 
 def _setup_master_env():
@@ -21,7 +21,6 @@ def _worker(
     build_dataset,
     build_kmeans,
     dataloader_kwargs: dict,
-    queue: mp.Queue,
     mode: str,
     centroids=None,
 ):
@@ -41,19 +40,13 @@ def _worker(
         if mode == "fit":
             centroids = km.fit(dataloader=dl, device=device)
             if rank == 0:
-                queue.put(centroids)
+                return centroids
         elif mode == "predict":
             if centroids is None:
                 raise ValueError("Centroids must be provided for prediction.")
             labels, distances, mappings = km.predict(centroids=centroids, dataloader=dl, device=device)
             if rank == 0:
-                queue.put((labels, distances, mappings))
-
-    except Exception as e:
-        if rank == 0:
-            queue.put(e)
-        raise e
-
+                return labels, distances, mappings
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
@@ -66,39 +59,36 @@ def distributed_fit(ctx,
                     build_kmeans,
                     num_gpus,
                     dataloader_kwargs):
-    manager = ctx.Manager()
-    queue = manager.Queue()
-
     _setup_master_env()
 
     procs = []
     try:
-        for rank, build_dataset in enumerate(build_datasets):
+        for rank in range(1, len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue, "fit"),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "fit"),
             )
             p.start()
             procs.append(p)
 
-        centroids = queue.get()
+        centroids = _worker(
+            rank=0,
+            world_size=num_gpus,
+            build_dataset=build_datasets[0],
+            build_kmeans=build_kmeans,
+            dataloader_kwargs=dataloader_kwargs,
+            mode="fit",
+        )
 
         for p in procs:
-            p.join(timeout=5)
-            if p.is_alive():
-                p.terminate()
-                p.join()
-
-    except Exception as e:
-        for p in procs:
-            if p.is_alive():
-                p.terminate()
-                p.join()
-        manager.shutdown()
-        raise e
-
+            p.join()
+    except FileNotFoundError:
+        pass
     finally:
-        manager.shutdown()
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join()
 
     return centroids
 
@@ -109,38 +99,36 @@ def distributed_predict(ctx,
                         centroids,
                         num_gpus,
                         dataloader_kwargs):
-    manager = ctx.Manager()
-    queue = manager.Queue()
-
     _setup_master_env()
     
     procs = []
     try:
-        for rank, build_dataset in enumerate(build_datasets):
+        for rank in range(1, len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_dataset, build_kmeans, dataloader_kwargs, queue, "predict", centroids),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "predict", centroids),
             )
             p.start()
             procs.append(p)
 
-        labels, distances, mappings = queue.get()
+        labels, distances, mappings = _worker(
+            rank=0,
+            world_size=num_gpus,
+            build_dataset=build_datasets[0],
+            build_kmeans=build_kmeans,
+            dataloader_kwargs=dataloader_kwargs,
+            mode="predict",
+            centroids=centroids,
+        )
 
         for p in procs:
-            p.join(timeout=5)
-            if p.is_alive():
-                p.terminate()
-                p.join()
-
-    except Exception as e:
-        for p in procs:
-            if p.is_alive():
-                p.terminate()
-                p.join()
-        manager.shutdown()
-        raise e
-    
+            p.join()
+    except FileNotFoundError:
+        pass
     finally:
-        manager.shutdown()
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join()
 
     return labels, distances, mappings

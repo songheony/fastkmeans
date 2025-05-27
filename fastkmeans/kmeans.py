@@ -254,7 +254,7 @@ class FastKMeans:
                 gathered = [g[:s] for g, s in zip(gathered, sizes)]
                 new_centroids = torch.cat(gathered, dim=0)
 
-                shift = torch.norm(new_centroids - centroids, dim=1).sum().item()
+                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
                 centroids.copy_(new_centroids)
             else:
                 local_sums = cluster_fused_data[:, :-1]
@@ -268,13 +268,13 @@ class FastKMeans:
                     random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
                     local_new_centroids[empty_ids] = random_data
 
-                shift = torch.norm(local_new_centroids - centroids, dim=1).sum().item()
+                shift = torch.norm(local_new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
                 centroids.copy_(local_new_centroids)
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
                 print(
-                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, total time: {time.time() - iteration_start_time + iteration_time:.4f}s, shift: {shift:.6f}"
+                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, shift: {shift:.6f}"
                 )
 
             if shift < _tol:
@@ -352,7 +352,7 @@ class FastKMeans:
                 distances.append(best_dist.cpu())
                 labels.append(best_ids.cpu())
 
-                if isinstance(batch, (list, tuple)):
+                if isinstance(batch, (list, tuple)) and len(batch) > 1:
                     for mapping in zip(*batch[:-1]):
                         mappings.append(mapping)
 
@@ -390,8 +390,8 @@ class FastKMeans:
             dist.barrier(group=gloo_group)
 
             if rank == 0:
-                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
-                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0).numpy()
+                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
+                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
                 mappings = sum(gathered_mappings, [])
 
             dist.destroy_process_group(gloo_group)
