@@ -243,21 +243,24 @@ class FastKMeans:
                     random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
                     new_centroids[empty_ids] = random_data
 
-                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
+                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum()
                 centroids.copy_(new_centroids)
+            else:
+                shift = torch.tensor(0.0, device=device, dtype=torch.float32)
 
             if dist.is_initialized():
                 dist.broadcast(centroids, src=0)
+                dist.broadcast(shift, src=0)
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
                 print(
-                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, shift: {shift:.6f}"
+                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, shift: {shift.item():.6f}"
                 )
 
-            if shift < _tol:
+            if shift.item() < _tol:
                 if self.verbose and rank == 0:
-                    print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {_tol})")
+                    print(f"Converged after {iteration + 1} iterations (shift: {shift.item():.6f} < tol: {_tol})")
                 break
 
         if rank == 0:
