@@ -229,47 +229,25 @@ class FastKMeans:
                     pbar.update(1)
 
             if dist.is_initialized():
-                base = self.k // world_size
-                extras = self.k % world_size
-                sizes = [base + (1 if r < extras else 0) for r in range(world_size)]
-                max_size = max(sizes)
+                dist.reduce(cluster_fused_data, dst=0, op=dist.ReduceOp.SUM)
 
-                chunks = list(cluster_fused_data.split(sizes, dim=0))
-                local_chunk = torch.zeros_like(chunks[rank])
-                dist.reduce_scatter(local_chunk, chunks, op=dist.ReduceOp.SUM)
-
-                local_sums = local_chunk[:, :-1]
-                local_counts = local_chunk[:, -1]
-                local_new_centroids = torch.zeros_like(local_sums, dtype=self.dtype)
-                mask = local_counts > 0
-                local_new_centroids[mask] = (local_sums[mask] / local_counts[mask].unsqueeze(1)).to(self.dtype)
+            if not dist.is_initialized() or rank == 0:
+                sums = cluster_fused_data[:, :-1]
+                counts = cluster_fused_data[:, -1]
+                new_centroids = torch.zeros_like(sums, dtype=self.dtype)
+                mask = counts > 0
+                new_centroids[mask] = (sums[mask] / counts[mask].unsqueeze(1)).to(self.dtype)
 
                 empty_ids = (~mask).nonzero(as_tuple=True)[0]
                 if len(empty_ids) > 0:
                     random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
-                    local_new_centroids[empty_ids] = random_data
-
-                gathered = [torch.empty(max_size, self.d, device=device, dtype=self.dtype) for _ in range(world_size)]
-                dist.all_gather(gathered, local_new_centroids)
-                gathered = [g[:s] for g, s in zip(gathered, sizes)]
-                new_centroids = torch.cat(gathered, dim=0)
+                    new_centroids[empty_ids] = random_data
 
                 shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
                 centroids.copy_(new_centroids)
-            else:
-                local_sums = cluster_fused_data[:, :-1]
-                local_counts = cluster_fused_data[:, -1]
-                local_new_centroids = torch.zeros_like(local_sums, dtype=self.dtype)
-                mask = local_counts > 0
-                local_new_centroids[mask] = (local_sums[mask] / local_counts[mask].unsqueeze(1)).to(self.dtype)
 
-                empty_ids = (~mask).nonzero(as_tuple=True)[0]
-                if len(empty_ids) > 0:
-                    random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
-                    local_new_centroids[empty_ids] = random_data
-
-                shift = torch.norm(local_new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
-                centroids.copy_(local_new_centroids)
+            if dist.is_initialized():
+                dist.broadcast(centroids, src=0)
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
