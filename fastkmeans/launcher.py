@@ -22,6 +22,7 @@ def _worker(
     build_kmeans,
     dataloader_kwargs: dict,
     mode: str,
+    queue,
     centroids=None,
 ):
     try:
@@ -40,13 +41,16 @@ def _worker(
         if mode == "fit":
             centroids = km.fit(dataloader=dl, device=device)
             if rank == 0:
-                return centroids
+                queue.put(centroids)
         elif mode == "predict":
             if centroids is None:
                 raise ValueError("Centroids must be provided for prediction.")
             labels, distances, mappings = km.predict(centroids=centroids, dataloader=dl, device=device)
             if rank == 0:
-                return labels, distances, mappings
+                queue.put((labels, distances, mappings))
+    except Exception as e:
+        if rank == 0:
+            queue.put(e)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
@@ -61,34 +65,32 @@ def distributed_fit(ctx,
                     dataloader_kwargs):
     _setup_master_env()
 
+    queue = ctx.Queue()
+
     procs = []
     try:
-        for rank in range(1, len(build_datasets)):
+        for rank in range(len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "fit"),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "fit", queue),
             )
             p.start()
             procs.append(p)
 
-        centroids = _worker(
-            rank=0,
-            world_size=num_gpus,
-            build_dataset=build_datasets[0],
-            build_kmeans=build_kmeans,
-            dataloader_kwargs=dataloader_kwargs,
-            mode="fit",
-        )
-
         for p in procs:
             p.join()
-    except FileNotFoundError:
-        pass
+
+        if not queue.empty():
+            result = queue.get()
+            if isinstance(result, Exception):
+                raise result
+            centroids = result
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
                 p.join()
+        queue.close()
 
     return centroids
 
@@ -100,35 +102,32 @@ def distributed_predict(ctx,
                         num_gpus,
                         dataloader_kwargs):
     _setup_master_env()
+
+    queue = ctx.Queue()
     
     procs = []
     try:
-        for rank in range(1, len(build_datasets)):
+        for rank in range(len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "predict", centroids),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "predict", queue, centroids),
             )
             p.start()
             procs.append(p)
 
-        labels, distances, mappings = _worker(
-            rank=0,
-            world_size=num_gpus,
-            build_dataset=build_datasets[0],
-            build_kmeans=build_kmeans,
-            dataloader_kwargs=dataloader_kwargs,
-            mode="predict",
-            centroids=centroids,
-        )
-
         for p in procs:
             p.join()
-    except FileNotFoundError:
-        pass
+
+        if not queue.empty():
+            result = queue.get()
+            if isinstance(result, Exception):
+                raise result
+            labels, distances, mappings = result
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
                 p.join()
+        queue.close()
 
     return labels, distances, mappings

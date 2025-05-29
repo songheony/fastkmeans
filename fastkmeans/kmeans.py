@@ -34,7 +34,7 @@ def _get_random_data(dataloader: DataLoader, n_samples: int, rng: torch.Generato
         Randomly sampled data from this rank.
     """
     chunks, total = [], 0
-    for batch in dataloader:
+    for _, batch in enumerate(dataloader):
         data = batch[-1] if isinstance(batch, (list, tuple)) else batch
         chunks.append(data)
         total += data.shape[0]
@@ -188,7 +188,7 @@ class FastKMeans:
             cluster_fused_data = torch.zeros((self.k, self.d + 1), device=device, dtype=torch.float32)
 
             with tqdm(desc=f"Fitting ({iteration + 1}th iteration)", disable=rank != 0, total=len(dataloader)) as pbar:
-                for batch in dataloader:
+                for _, batch in enumerate(dataloader):
                     data_chunk = batch[-1] if isinstance(batch, (list, tuple)) else batch
                     data_chunk = data_chunk.to(device, dtype=self.dtype, non_blocking=True)
                     data_chunk_norms = (data_chunk ** 2).sum(dim=1)
@@ -229,9 +229,36 @@ class FastKMeans:
                     pbar.update(1)
 
             if dist.is_initialized():
-                dist.reduce(cluster_fused_data, dst=0, op=dist.ReduceOp.SUM)
+                dist.barrier()
 
-            if not dist.is_initialized() or rank == 0:
+                base = self.k // world_size
+                extras = self.k % world_size
+                sizes = [base + (1 if r < extras else 0) for r in range(world_size)]
+                max_size = max(sizes)
+
+                chunks = list(cluster_fused_data.split(sizes, dim=0))
+                local_chunk = torch.zeros_like(chunks[rank])
+                dist.reduce_scatter(local_chunk, chunks, op=dist.ReduceOp.SUM)
+
+                local_sums = local_chunk[:, :-1]
+                local_counts = local_chunk[:, -1]
+                local_new_centroids = torch.zeros_like(local_sums, dtype=self.dtype)
+                mask = local_counts > 0
+                local_new_centroids[mask] = (local_sums[mask] / local_counts[mask].unsqueeze(1)).to(self.dtype)
+
+                empty_ids = (~mask).nonzero(as_tuple=True)[0]
+                if len(empty_ids) > 0:
+                    random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
+                    local_new_centroids[empty_ids] = random_data
+
+                gathered = [torch.empty(max_size, self.d, device=device, dtype=self.dtype) for _ in range(world_size)]
+                dist.all_gather(gathered, local_new_centroids)
+                gathered = [g[:s] for g, s in zip(gathered, sizes)]
+                new_centroids = torch.cat(gathered, dim=0)
+
+                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
+                centroids.copy_(new_centroids)
+            else:
                 sums = cluster_fused_data[:, :-1]
                 counts = cluster_fused_data[:, -1]
                 new_centroids = torch.zeros_like(sums, dtype=self.dtype)
@@ -243,24 +270,18 @@ class FastKMeans:
                     random_data = _get_random_data(dataloader, len(empty_ids), self.rng).to(device=device, dtype=self.dtype)
                     new_centroids[empty_ids] = random_data
 
-                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum()
+                shift = torch.norm(new_centroids - centroids, dim=1, dtype=torch.float).sum().item()
                 centroids.copy_(new_centroids)
-            else:
-                shift = torch.tensor(0.0, device=device, dtype=torch.float32)
-
-            if dist.is_initialized():
-                dist.broadcast(centroids, src=0)
-                dist.broadcast(shift, src=0)
 
             iteration_time = time.time() - iteration_start_time
             if self.verbose and rank == 0:
                 print(
-                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, shift: {shift.item():.6f}"
+                    f"Iteration {iteration + 1}/{self.niter} took {iteration_time:.4f}s, shift: {shift:.6f}"
                 )
 
-            if shift.item() < _tol:
+            if shift < _tol:
                 if self.verbose and rank == 0:
-                    print(f"Converged after {iteration + 1} iterations (shift: {shift.item():.6f} < tol: {_tol})")
+                    print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {_tol})")
                 break
 
         if rank == 0:
@@ -298,7 +319,7 @@ class FastKMeans:
         best_dist, best_ids = None, None
 
         with tqdm(desc="Prediction", disable=rank != 0, total=len(dataloader)) as pbar:
-            for batch in dataloader:
+            for _, batch in enumerate(dataloader):
                 data_chunk = batch[-1] if isinstance(batch, (list, tuple)) else batch
                 data_chunk = data_chunk.to(device=device, dtype=self.dtype, non_blocking=True)
                 data_chunk_norms = (data_chunk**2).sum(dim=1)
@@ -343,6 +364,8 @@ class FastKMeans:
         distances = torch.cat(distances, dim=0)
 
         if dist.is_initialized():
+            dist.barrier()
+
             gloo_group = dist.new_group(backend="gloo", ranks=list(range(world_size)))
 
             length = torch.tensor([labels.numel()], dtype=torch.int64)
