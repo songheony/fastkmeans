@@ -1,5 +1,7 @@
 import os
 import socket
+import tempfile
+import pickle
 
 import torch
 from torch.utils.data import DataLoader
@@ -22,7 +24,7 @@ def _worker(
     build_kmeans,
     dataloader_kwargs: dict,
     mode: str,
-    queue,
+    save_dir: str,
     centroids=None,
 ):
     try:
@@ -39,18 +41,11 @@ def _worker(
         km = build_kmeans()
 
         if mode == "fit":
-            centroids = km.fit(dataloader=dl, device=device)
-            if rank == 0:
-                queue.put(centroids)
+            km.fit(dataloader=dl, device=device, save_dir=save_dir)
         elif mode == "predict":
             if centroids is None:
                 raise ValueError("Centroids must be provided for prediction.")
-            labels, distances, mappings = km.predict(centroids=centroids, dataloader=dl, device=device)
-            if rank == 0:
-                queue.put((labels, distances, mappings))
-    except Exception as e:
-        if rank == 0:
-            queue.put(e)
+            km.predict(centroids=centroids, dataloader=dl, device=device, save_dir=save_dir)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
@@ -65,14 +60,13 @@ def distributed_fit(ctx,
                     dataloader_kwargs):
     _setup_master_env()
 
-    queue = ctx.Queue()
-
     procs = []
+    tempdir = tempfile.TemporaryDirectory()
     try:
         for rank in range(len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "fit", queue),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "fit", tempdir.name),
             )
             p.start()
             procs.append(p)
@@ -80,17 +74,14 @@ def distributed_fit(ctx,
         for p in procs:
             p.join()
 
-        if not queue.empty():
-            result = queue.get()
-            if isinstance(result, Exception):
-                raise result
-            centroids = result
+        centroids = torch.load(os.path.join(tempdir.name, "centroids.pt"), weights_only=True)
+
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
                 p.join()
-        queue.close()
+        tempdir.cleanup()
 
     return centroids
 
@@ -102,15 +93,14 @@ def distributed_predict(ctx,
                         num_gpus,
                         dataloader_kwargs):
     _setup_master_env()
-
-    queue = ctx.Queue()
     
     procs = []
+    tempdir = tempfile.TemporaryDirectory()
     try:
         for rank in range(len(build_datasets)):
             p = ctx.Process(
                 target=_worker,
-                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "predict", queue, centroids),
+                args=(rank, num_gpus, build_datasets[rank], build_kmeans, dataloader_kwargs, "predict", tempdir.name, centroids),
             )
             p.start()
             procs.append(p)
@@ -118,16 +108,22 @@ def distributed_predict(ctx,
         for p in procs:
             p.join()
 
-        if not queue.empty():
-            result = queue.get()
-            if isinstance(result, Exception):
-                raise result
-            labels, distances, mappings = result
+        labels = []
+        distances = []
+        mappings = []
+        for rank in range(len(build_datasets)):
+            labels.append(torch.load(os.path.join(tempdir.name,  f"rank_{rank}", "labels.pt"), weights_only=True))
+            distances.append(torch.load(os.path.join(tempdir.name,  f"rank_{rank}", "distances.pt"), weights_only=True))
+            with open(os.path.join(tempdir.name, f"rank_{rank}", "mappings.pkl"), "rb") as f:
+                mappings.extend(pickle.load(f))
+
+        labels = torch.cat(labels, dim=0)
+        distances = torch.cat(distances, dim=0)
+
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
                 p.join()
-        queue.close()
 
     return labels, distances, mappings

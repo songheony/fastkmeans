@@ -1,3 +1,5 @@
+import os
+import pickle
 import time
 
 import torch
@@ -128,7 +130,7 @@ class FastKMeans:
         self.use_triton = use_triton
 
     @torch.no_grad()
-    def fit(self, dataloader: DataLoader, device: torch.device):
+    def fit(self, dataloader: DataLoader, device: torch.device, save_dir: str):
         """
         Fits the KMeans model to the data.
 
@@ -138,6 +140,8 @@ class FastKMeans:
             Dataloader to fit the model to.
         device : torch.device
             Device to use for computation.
+        save_dir : str
+            Directory to save the centroids to.
         """
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -284,11 +288,11 @@ class FastKMeans:
                     print(f"Converged after {iteration + 1} iterations (shift: {shift:.6f} < tol: {_tol})")
                 break
 
-        if rank == 0:
-            return centroids.cpu().contiguous()
+        if not dist.is_initialized() or rank == 0:
+            torch.save(centroids.cpu(), os.path.join(save_dir, "centroids.pt"))
 
     @torch.no_grad()
-    def predict(self, centroids: np.ndarray, dataloader: DataLoader, device: torch.device) -> tuple[np.ndarray, list]:
+    def predict(self, centroids: np.ndarray, dataloader: DataLoader, device: torch.device, save_dir: str):
         """
         Predicts the cluster labels for the data in the dataloader.
 
@@ -300,11 +304,8 @@ class FastKMeans:
             Dataloader to predict the labels for.
         device : torch.device
             Device to use for computation.
-
-        Returns
-        -------
-        tuple[np.ndarray, list]
-            Tuple containing the predicted labels and a list of mappings.
+        save_dir : str
+            Directory to save the labels and distances to.
         """
         centroids_torch = torch.as_tensor(centroids, device=device, dtype=self.dtype)
         centroid_norms = (centroids_torch**2).sum(dim=1)
@@ -314,7 +315,6 @@ class FastKMeans:
         distances = []
 
         rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         best_dist, best_ids = None, None
 
@@ -364,43 +364,10 @@ class FastKMeans:
         distances = torch.cat(distances, dim=0)
 
         if dist.is_initialized():
-            dist.barrier()
+            save_dir = os.path.join(save_dir, f"rank_{rank}")
+            os.makedirs(save_dir, exist_ok=True)
 
-            gloo_group = dist.new_group(backend="gloo", ranks=list(range(world_size)))
-
-            length = torch.tensor([labels.numel()], dtype=torch.int64)
-            all_lengths = [torch.empty_like(length) for _ in range(world_size)]
-            dist.all_gather(all_lengths, length, group=gloo_group)
-
-            max_length = max([l.item() for l in all_lengths])
-
-            if max_length > length.item():
-                pad = max_length - labels.size(0)
-                labels = torch.cat([labels, torch.empty(pad, dtype=torch.long)])
-                distances = torch.cat([distances, torch.empty(pad, dtype=torch.float32)])
-
-            if rank == 0:
-                gathered_labels = [torch.empty_like(labels) for _ in range(world_size)]
-                gathered_distances = [torch.empty_like(distances) for _ in range(world_size)]
-                gathered_mappings = [None] * world_size
-                dist.gather(labels, gathered_labels, dst=0, group=gloo_group)
-                dist.gather(distances, gathered_distances, dst=0, group=gloo_group)
-                dist.gather_object(mappings, gathered_mappings, dst=0, group=gloo_group)
-            else:
-                dist.gather(labels, dst=0, group=gloo_group)
-                dist.gather(distances, dst=0, group=gloo_group)
-                dist.gather_object(mappings, dst=0, group=gloo_group)
-
-            dist.barrier(group=gloo_group)
-
-            if rank == 0:
-                labels = torch.cat([gathered_labels[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
-                distances = torch.cat([gathered_distances[i][:all_lengths[i].item()] for i in range(world_size)], dim=0)
-                mappings = sum(gathered_mappings, [])
-
-            dist.destroy_process_group(gloo_group)
-
-        if rank == 0:
-            return labels, distances, mappings
-        else:
-            return None, None, None
+        torch.save(labels, os.path.join(save_dir, "labels.pt"))
+        torch.save(distances, os.path.join(save_dir, "distances.pt"))
+        with open(os.path.join(save_dir, "mappings.pkl"), "wb") as f:
+            pickle.dump(mappings, f)
