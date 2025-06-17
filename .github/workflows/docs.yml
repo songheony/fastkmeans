@@ -2,9 +2,8 @@ name: Build Documentation
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+  release:
+    types: [created]
 
 permissions:
   contents: write # Required to push to gh-pages branch
@@ -17,13 +16,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
         with:
-          version: "0.7.3" # Pin for reproducibility
+          version: "0.7.13" # Pin for reproducibility
           python-version: '3.12'
 
       - name: Install fastkmeans dependencies
-        run: uv sync --extras docs --dev
+        run: uv sync --group docs
 
       - name: Configure Git Credentials
         run: |
@@ -32,4 +31,4 @@ jobs:
         shell: bash
 
       - name: Deploy documentation to GitHub Pages
-        run: mkdocs gh-deploy --force --clean
+        run: uv run mkdocs gh-deploy --force --clean

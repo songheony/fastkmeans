@@ -56,6 +56,8 @@ There are some libraries (such as NVidia's own implementations), but they again 
 
 While the Triton kernel uses significantly less memory than the PyTorch implementation, increasing the chunk size above 512K can result in slower performance.
 
+> Note: Use PyTorch 2.7.1 or newer if using the Triton backend on AMD or Intel GPUs.
+
 ### Speed
 
 Below is `fastkmeans` benchmarked against `faiss` on a single RTX 4090 GPU, with 128-dimensional data points at various data scales that will commonly be used in ColBERT-style indexing (8192, 16384, 32768, 65536, and 131072 clusters, each with w/ cluster_size*100 data points).

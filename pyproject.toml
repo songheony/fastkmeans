@@ -25,6 +25,7 @@ docs = [
     "mkdocs-material>=9.6.12",
     "mkdocstrings[python]>=0.26.1",
     "pymdown-extensions>=10.15",
+    "torch>=2.7"
 ]
 
 [project.optional-dependencies]
@@ -34,3 +35,11 @@ bench = [
     "seaborn>=0.13.2",
     "typer>=0.15.3",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", group = "docs" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
