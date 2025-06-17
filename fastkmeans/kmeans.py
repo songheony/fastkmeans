@@ -49,7 +49,7 @@ def _kmeans_torch_double_chunked(
     tol: float = 1e-8,
     chunk_size_data: int = 51_200,
     chunk_size_centroids: int = 10_240,
-    max_points_per_centroid: int | None = None,
+    max_points_per_centroid: int | None = 256,
     verbose: bool = False,
     use_triton: bool | None = None,
 ):
