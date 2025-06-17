@@ -22,7 +22,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install fastkmeans dependencies
-        run: uv sync --group docs
+        run: uv sync --group docs --group cpu
 
       - name: Configure Git Credentials
         run: |
