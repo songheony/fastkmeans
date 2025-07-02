@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pickle
 import time
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -87,9 +88,9 @@ class FastKMeans:
         Dimensionality of the input features (n_features).
     k  : int
         Number of clusters.
-    niter : int, default=20
+    niter : int, default=25
         Maximum number of iterations.
-    tol : float, default=1e-4
+    tol : float, default=1e-8
         Stopping threshold for centroid movement.
     seed : int, default=0
         Random seed for centroid initialization and (if needed) subsampling.
