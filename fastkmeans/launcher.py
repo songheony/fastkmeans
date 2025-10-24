@@ -125,5 +125,6 @@ def distributed_predict(ctx,
             if p.is_alive():
                 p.terminate()
                 p.join()
+        tempdir.cleanup()
 
     return labels, distances, mappings
